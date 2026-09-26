@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/bufferDownloadBatch.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -119,39 +120,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 namespace {
 
-// Largest single copy and largest staging batch for buffer downloads. Keeps every batch well
-// inside the 64 MiB download staging buffer.
-constexpr uint64_t MaxDownloadChunk = 32 * MiB;
-
-// Moves the next run of copies that fits in one staging batch into `batch`, packing each copy
-// onto its own 64-byte cache line. Returns the batch's staging size.
-uint64_t NextDownloadBatch(const std::vector<vk::BufferCopy>& copies, size_t& index,
-                           std::vector<vk::BufferCopy>& batch) {
-	batch.clear();
-	uint64_t batch_total_size = 0;
-	while (index < copies.size()) {
-		const auto& copy         = copies[index];
-		const auto  aligned_size = Common::AlignUp(copy.size, 64);
-		if (!batch.empty() && batch_total_size + aligned_size > MaxDownloadChunk) {
-			break;
-		}
-		batch.emplace_back(copy.srcOffset, batch_total_size, copy.size);
-		batch_total_size += aligned_size;
-		++index;
+std::vector<BufferDownloadRange> ToDownloadRanges(const std::vector<vk::BufferCopy>& copies) {
+	std::vector<BufferDownloadRange> ranges;
+	ranges.reserve(copies.size());
+	for (const auto& copy: copies) {
+		ranges.push_back({copy.srcOffset, copy.size});
 	}
-	return batch_total_size;
+	return ranges;
 }
 
 } // namespace
 
-/**
- * @brief Collects the GPU-modified ranges of a buffer that need downloading.
- *
- * Large modified spans are sliced into chunks of at most MaxDownloadChunk bytes so callers can
- * stage them in batches that fit the download buffer.
- *
- * @return true if any modified ranges were found, false otherwise.
- */
 bool BufferCache::CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                         std::vector<vk::BufferCopy>& copies,
                                         uint64_t&                    total_size) {
@@ -161,14 +140,9 @@ bool BufferCache::CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    auto current = start;
-			    while (current < end) {
-				    const auto slice_size = std::min(end - current, MaxDownloadChunk);
-				    copies.emplace_back(current - buffer_address, total_size, slice_size);
-				    // Keep packed ranges on separate cache lines, as in shadPS4.
-				    total_size += Common::AlignUp(slice_size, 64);
-				    current += slice_size;
-			    }
+			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    // Keep packed ranges on separate cache lines, as in shadPS4.
+			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
@@ -176,9 +150,9 @@ bool BufferCache::CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t
 }
 
 bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
+	std::vector<vk::BufferCopy> collected;
 	uint64_t                    total_size = 0;
-	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
+	if (!CollectDownloadCopies(buffer, vaddr, size, collected, total_size)) {
 		return false;
 	}
 
@@ -203,18 +177,20 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		        vk::Result::eSuccess);
 	}
 
-	const auto                  buffer_address = buffer.CpuAddress();
-	std::vector<vk::BufferCopy> batch;
-	size_t                      index = 0;
-	while (index < copies.size()) {
-		const uint64_t batch_total_size = NextDownloadBatch(copies, index, batch);
-		const auto [mapped, offset]     = m_download_buffer.Map(batch_total_size, 64);
+	// Stage in batches that each fit one download-buffer reservation, as DownloadBufferMemory
+	// does. Every batch is submitted and waited on before the next is mapped.
+	const auto buffer_address = buffer.CpuAddress();
+	for (const auto& batch: SplitBufferDownload(ToDownloadRanges(collected),
+	                                            m_download_buffer.MaxReservation(), 64)) {
+		const auto [mapped, offset] = m_download_buffer.Map(batch.total_size, 64);
 		if (mapped == nullptr) {
-			EXIT("BufferCache: download exceeds staging buffer capacity\n");
+			EXIT("BufferCache: readback batch could not be staged\n");
 		}
 		m_download_buffer.Commit();
-		for (auto& copy: batch) {
-			copy.dstOffset += offset;
+		std::vector<vk::BufferCopy> copies;
+		copies.reserve(batch.copies.size());
+		for (const auto& copy: batch.copies) {
+			copies.push_back({copy.src_offset, copy.dst_offset + offset, copy.size});
 		}
 
 		const auto command = m_readback_command;
@@ -236,13 +212,13 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 		                        nullptr);
 		command.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
-		                   static_cast<uint32_t>(batch.size()), batch.data());
+		                   static_cast<uint32_t>(copies.size()), copies.data());
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
 		after.buffer        = m_download_buffer.Handle();
 		after.offset        = offset;
-		after.size          = batch_total_size;
+		after.size          = batch.total_size;
 		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
 		                        nullptr);
@@ -274,8 +250,8 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			EXIT("BufferCache: readback wait failed: %s\n", vk::to_string(wait_result).c_str());
 		}
 
-		m_download_buffer.Invalidate(offset, batch_total_size);
-		for (const auto& copy: batch) {
+		m_download_buffer.Invalidate(offset, batch.total_size);
+		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
@@ -283,44 +259,41 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return true;
 }
 
-/**
- * @brief Downloads GPU-modified buffer ranges back to CPU guest memory.
- *
- * Batches the collected transfers so they do not exceed staging buffer capacity, then defers
- * invalidation and backing writeback.
- *
- * @param buffer Source GPU buffer to download from.
- * @param vaddr Guest virtual address of the requested download range.
- * @param size Size in bytes of the requested download range.
- * @return true if any modified ranges were found and scheduled for download, false otherwise.
- */
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
+	std::vector<vk::BufferCopy> collected;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
-	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
+	if (!CollectDownloadCopies(buffer, vaddr, size, collected, total_size)) {
 		return false;
 	}
 
-	size_t index = 0;
-	while (index < copies.size()) {
-		std::vector<vk::BufferCopy> batch_copies;
-		const uint64_t batch_total_size = NextDownloadBatch(copies, index, batch_copies);
-
-		const auto [mapped, offset] = m_download_buffer.Map(batch_total_size, 64);
+	// StreamBuffer::Map refuses a single reservation larger than the staging buffer instead of
+	// waiting for space, so a download whose dirty ranges total more than one staging pass
+	// could never be mapped and used to abort the process here. Stage it in batches instead:
+	// each reserves its own region, and the stream keeps that region reserved until its
+	// deferred write-back has consumed it, so consecutive batches cannot overlap.
+	for (const auto& batch: SplitBufferDownload(ToDownloadRanges(collected),
+	                                            m_download_buffer.MaxReservation(), 64)) {
+		const auto [mapped, offset] = m_download_buffer.Map(batch.total_size, 64);
 		if (mapped == nullptr) {
-			EXIT("BufferCache: download exceeds staging buffer capacity\n");
+			EXIT("BufferCache: download batch could not be staged\n");
 		}
 		m_download_buffer.Commit();
-		for (auto& copy: batch_copies) {
-			copy.dstOffset += offset;
-		}
-
+		// Map can wait for a pending use of the staging buffer to retire. Waiting submits the
+		// current command buffer and begins a new one, so re-read the handle after every Map
+		// instead of recording later batches into a handle captured before the loop.
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto              native = command.Handle();
+		const auto native = command.Handle();
+		std::vector<vk::BufferCopy> copies;
+		copies.reserve(batch.copies.size());
+		for (const auto& copy: batch.copies) {
+			copies.push_back({copy.src_offset, copy.dst_offset + offset, copy.size});
+		}
+
 		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.srcAccessMask =
+		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 		before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -331,24 +304,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 		                       nullptr);
 		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
-		                  static_cast<uint32_t>(batch_copies.size()), batch_copies.data());
+		                  static_cast<uint32_t>(copies.size()), copies.data());
 
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
 		after.buffer        = m_download_buffer.Handle();
 		after.offset        = offset;
-		after.size          = batch_total_size;
+		after.size          = batch.total_size;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands |
 		                           vk::PipelineStageFlagBits::eHost,
 		                       {}, 0, nullptr, 1, &after, 0, nullptr);
-		m_scheduler.DeferPriorityOperation([this, mapped, offset, batch_total_size, buffer_address,
-		                                    batch_copies = std::move(batch_copies)] {
-			m_download_buffer.Invalidate(offset, batch_total_size);
-			for (const auto& copy: batch_copies) {
-				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-				                                      mapped + (copy.dstOffset - offset), copy.size);
+		const uint64_t total = batch.total_size;
+		m_scheduler.DeferPriorityOperation([this, mapped, offset, total, buffer_address,
+		                                    copies = std::move(copies)] {
+			m_download_buffer.Invalidate(offset, total);
+			for (const auto& copy: copies) {
+				const auto* const staged = mapped + (copy.dstOffset - offset);
+				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, staged,
+				                                      copy.size);
 			}
 		});
 	}
