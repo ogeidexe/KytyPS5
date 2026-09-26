@@ -49,14 +49,9 @@ std::shared_ptr<spdlog::logger> MakeFileLogger(std::string                  name
 		std::filesystem::create_directories(parent);
 	}
 
-<<<<<<< HEAD
 	// rotate_on_open matches the old truncate-on-open "fresh file each run" behavior.
 	auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-	    Common::PathToString(path), kMaxLogFileSize, kMaxLogFiles, true);
-=======
-	auto sink =
-	    std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), true);
->>>>>>> upstream/main
+	    path.native(), kMaxLogFileSize, kMaxLogFiles, true);
 	return MakeLogger(std::move(name), std::move(sink));
 }
 
