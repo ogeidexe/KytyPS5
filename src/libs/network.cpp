@@ -1174,7 +1174,7 @@ static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wa
 		    !SocketIsStream(socket)) {
 			// A zero-length datagram peek uses a one-byte scratch buffer to obtain the
 			// source address. Never report that scratch byte as data to the guest.
-			return host_len == 0 ? 0 : peeked;
+			return std::min<int64_t>(peeked, static_cast<int64_t>(host_len));
 		}
 		peer_closed = WaitForPeekedBytes(socket);
 		if (peer_closed) {

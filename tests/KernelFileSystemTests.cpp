@@ -449,6 +449,13 @@ void CheckSocketWakeup() {
         "send wake bytes with guest MSG_NOSIGNAL");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
+  const auto wait_readable = [&readable, &deadline](int fd, const char* message) {
+    const auto fd_bit = uint64_t {1} << (fd % 64);
+    readable[fd / 64] = fd_bit;
+    Check(Net::Select(fd + 1, readable.data(), nullptr, nullptr, deadline.data()) == 1 &&
+              readable[fd / 64] == fd_bit,
+          message);
+  };
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
@@ -476,8 +483,11 @@ void CheckSocketWakeup() {
       // A short or failed send would strand the blocking receive below. The writer is
       // still open, so no end of stream ever arrives and the peek loop would spin
       // forever instead of failing. Half-close this end so the reader sees EOF and
-      // the receive returns the short prefix, which fails the check below.
+      // the receive returns the short prefix, which fails the check below. Close too:
+      // Shutdown is a Windows-only no-op elsewhere, and a closed writer makes the
+      // receive fail on every platform.
       Net::Shutdown(writer, 1);
+      Net::SocketClose(writer);
     }
   });
   std::array<char, text_length> message {};
@@ -495,10 +505,7 @@ void CheckSocketWakeup() {
   // MSG_DONTWAIT must never wait for the rest of the message.
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-waiting peek");
-  readable[reader / 64] = bit;
-  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
-                    deadline.data()) == 1,
-        "non-waiting peek bytes are readable");
+  wait_readable(reader, "non-waiting peek bytes arrived");
   Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == prefix_length,
         "guest MSG_DONTWAIT PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
@@ -512,10 +519,7 @@ void CheckSocketWakeup() {
         "enable the guest non-blocking socket");
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-blocking socket peek");
-  readable[reader / 64] = bit;
-  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
-                    deadline.data()) == 1,
-        "non-blocking socket peek bytes are readable");
+  wait_readable(reader, "non-blocking socket peek bytes arrived");
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == prefix_length,
         "non-blocking socket PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
@@ -572,10 +576,12 @@ void CheckSocketWakeup() {
             Net::Connect(inherited_writer, inherited_address.data(),
                          inherited_address_size) == 0,
         "connect to nonblocking listener");
+  wait_readable(inherited_listener, "accepted-mode connection is queued");
   const int inherited_reader = Net::Accept(inherited_listener, nullptr, nullptr);
   Check(inherited_reader >= 0, "accept nonblocking listener socket");
   Check(Net::Send(inherited_writer, text, prefix_length, 0) == prefix_length,
         "send accepted-mode prefix");
+  wait_readable(inherited_reader, "accepted-mode prefix arrived");
   std::array<char, text_length> inherited_message {};
   auto inherited_receive = std::async(std::launch::async, [&] {
     return Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(),
