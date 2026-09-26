@@ -703,7 +703,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
-		const auto metadata = mount_dir / "sce_sys";
+		const auto metadata = std::filesystem::path(mount_dir) / "sce_sys";
 		std::error_code error;
 		std::filesystem::create_directories(metadata, error);
 		if (error) {

@@ -254,7 +254,7 @@ bool ValidateElfFile(const std::filesystem::path& file_name, ElfValidationReport
 	auto image = file.ReadWholeBuffer();
 	file.Close();
 	return ValidateElfImage(
-	    {reinterpret_cast<const uint8_t*>(image.GetDataConst()), image.Size()}, report, error);
+	    {reinterpret_cast<const uint8_t*>(image.data()), image.size()}, report, error);
 }
 
 } // namespace Loader
