@@ -557,13 +557,78 @@ void BufferCache::WriteBackHotPages() {
 		auto&      buffer = m_slot_buffers[id];
 		const auto begin  = std::max(page, buffer.CpuAddress());
 		const auto end    = std::min(page + TRACKER_PAGE_SIZE, buffer.CpuAddress() + buffer.Size());
-		if (begin < end && DownloadBufferMemory(buffer, begin, end - begin)) {
+		if (begin < end && EagerDownload(buffer, begin, end - begin)) {
 			// The copy and its deferred write-back belong to the command buffer about to be
 			// submitted as this tick.
 			inflight = m_scheduler.CurrentTick();
 			Common::FrameStats::g_eager_scheduled.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
+}
+
+// DownloadBufferMemory for an eager write-back, which is only an optimization and so must never
+// block: staging space is reserved without waiting before any dirty range is taken, and when none
+// is free the page is simply left for the next submit (or an on-demand read) to handle.
+bool BufferCache::EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	uint64_t needed = 0;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		needed += Common::AlignUp(end - start, 64);
+	});
+	if (needed == 0) {
+		return false;
+	}
+	const auto [mapped, offset] = m_download_buffer.Map(needed, 64, false);
+	if (mapped == nullptr) {
+		Common::FrameStats::g_eager_skipped.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total = 0;
+	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total)) {
+		return false;
+	}
+	EXIT_IF(total > needed);
+	m_download_buffer.Commit();
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
+	}
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+	                  static_cast<uint32_t>(copies.size()), copies.data());
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_download_buffer.Handle();
+	after.offset        = offset;
+	after.size          = needed;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	const auto buffer_address = buffer.CpuAddress();
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, needed, buffer_address,
+	                                    copies = std::move(copies)] {
+		m_download_buffer.Invalidate(offset, needed);
+		for (const auto& copy: copies) {
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+	});
+	return true;
 }
 
 void BufferCache::RetireHotPages(uint64_t vaddr, uint64_t size, bool wait) {

@@ -157,6 +157,7 @@ private:
 	std::map<uint64_t, uint64_t> m_hot_pages;
 	void RetireHotPages(uint64_t vaddr, uint64_t size, bool wait);
 	bool VerifyWrittenBack(uint64_t page);
+	bool EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	struct KnownFill {
 		uint64_t end;

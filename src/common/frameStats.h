@@ -54,6 +54,7 @@ inline std::atomic<uint32_t> g_cpu_read_flushes {0};
 // KYTY_DEP_VERIFY mismatches between written-back and GPU data (must stay 0).
 inline std::atomic<uint32_t> g_eager_scheduled {0};
 inline std::atomic<uint32_t> g_eager_retired {0};
+inline std::atomic<uint32_t> g_eager_skipped {0}; // no staging space free without waiting
 inline std::atomic<uint32_t> g_dep_mismatches {0};
 
 inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
