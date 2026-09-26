@@ -12,6 +12,8 @@ namespace Common::FrameStats {
 
 inline std::atomic<uint64_t> g_compile_us {0};
 inline std::atomic<uint32_t> g_compile_count {0};
+inline std::atomic<uint32_t> g_image_creates {0};
+inline std::atomic<uint32_t> g_image_deletes {0};
 
 // Adds the lifetime of the scope to the compile counters.
 class CompileScope {

@@ -965,9 +965,11 @@ void WindowContext::UpdateTitle() {
 			// std::printf, not LOGF: the report was asked for explicitly, so it must not be
 			// muted by the printf direction.
 			std::printf("[frame-stats] frame=%" PRIu64 " frames=%u worst=%.1fms over33=%u"
-			            " over100=%u compiles=%u compile=%.1fms\n",
+			            " over100=%u compiles=%u compile=%.1fms images+%u/-%u\n",
 			            frame_num, stats_frames, worst_ms, over_33ms, over_100ms, compiles,
-			            static_cast<double>(compile_us) / 1000.0);
+			            static_cast<double>(compile_us) / 1000.0,
+			            Common::FrameStats::g_image_creates.exchange(0),
+			            Common::FrameStats::g_image_deletes.exchange(0));
 			std::fflush(stdout);
 			stats_start  = now;
 			worst_ms     = 0.0;
