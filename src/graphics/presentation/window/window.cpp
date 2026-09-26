@@ -988,6 +988,14 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
+	// This runs on every presented frame. Setting the title repaints the title bar and has to go
+	// through the main thread, so throttle it and never block the presenting thread on it.
+	static uint64_t last_title_update = 0;
+	if (last_title_update != 0 && now - last_title_update < frequency / 4) {
+		return;
+	}
+	last_title_update = now;
+
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
@@ -996,15 +1004,22 @@ void WindowContext::UpdateTitle() {
 	    device_name, processor_name, frame_num, current_fps);
 
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
+		SDL_WindowID window_id;
+		std::string  text;
+	};
+	auto* update = new TitleUpdate {SDL_GetWindowID(window), std::move(text)};
+	const bool queued = SDL_RunOnMainThread(
 	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
+		    std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		    // Looked up by id: the window may have closed while this update was queued.
+		    if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
+			    SDL_SetWindowTitle(target, title->text.c_str());
+		    }
 	    },
-	    &update, true));
+	    update, false);
+	if (!queued) {
+		delete update;
+	}
 }
 
 } // namespace Libs::Graphics
