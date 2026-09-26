@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -116,25 +117,44 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-/**
- * @brief Downloads GPU-modified buffer ranges back to CPU guest memory.
- *
- * Slices large modified spans into bounded chunks and batches transfers so they do not
- * exceed staging buffer capacity, then defers invalidation and backing writeback.
- *
- * @param buffer Source GPU buffer to download from.
- * @param vaddr Guest virtual address of the requested download range.
- * @param size Size in bytes of the requested download range.
- * @return true if any modified ranges were found and scheduled for download, false otherwise.
- */
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	struct DownloadSlice {
-		uint64_t src_offset;
-		uint64_t size;
-	};
-	std::vector<DownloadSlice> slices;
-	constexpr uint64_t         MaxDownloadChunk = 32 * MiB;
+namespace {
 
+// Largest single copy and largest staging batch for buffer downloads. Keeps every batch well
+// inside the 64 MiB download staging buffer.
+constexpr uint64_t MaxDownloadChunk = 32 * MiB;
+
+// Moves the next run of copies that fits in one staging batch into `batch`, packing each copy
+// onto its own 64-byte cache line. Returns the batch's staging size.
+uint64_t NextDownloadBatch(const std::vector<vk::BufferCopy>& copies, size_t& index,
+                           std::vector<vk::BufferCopy>& batch) {
+	batch.clear();
+	uint64_t batch_total_size = 0;
+	while (index < copies.size()) {
+		const auto& copy         = copies[index];
+		const auto  aligned_size = Common::AlignUp(copy.size, 64);
+		if (!batch.empty() && batch_total_size + aligned_size > MaxDownloadChunk) {
+			break;
+		}
+		batch.emplace_back(copy.srcOffset, batch_total_size, copy.size);
+		batch_total_size += aligned_size;
+		++index;
+	}
+	return batch_total_size;
+}
+
+} // namespace
+
+/**
+ * @brief Collects the GPU-modified ranges of a buffer that need downloading.
+ *
+ * Large modified spans are sliced into chunks of at most MaxDownloadChunk bytes so callers can
+ * stage them in batches that fit the download buffer.
+ *
+ * @return true if any modified ranges were found, false otherwise.
+ */
+bool BufferCache::CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        std::vector<vk::BufferCopy>& copies,
+                                        uint64_t&                    total_size) {
 	const auto buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
@@ -144,31 +164,148 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    auto current = start;
 			    while (current < end) {
 				    const auto slice_size = std::min(end - current, MaxDownloadChunk);
-				    slices.push_back({current - buffer_address, slice_size});
+				    copies.emplace_back(current - buffer_address, total_size, slice_size);
+				    // Keep packed ranges on separate cache lines, as in shadPS4.
+				    total_size += Common::AlignUp(slice_size, 64);
 				    current += slice_size;
 			    }
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
-	if (slices.empty()) {
+	return !copies.empty();
+}
+
+bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
 		return false;
 	}
 
-	size_t slice_idx = 0;
-	while (slice_idx < slices.size()) {
-		std::vector<vk::BufferCopy> batch_copies;
-		uint64_t                    batch_total_size = 0;
+	const auto device = m_graphics.device;
+	if (m_readback_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		EXIT_IF(device.createCommandPool(&pool_info, nullptr, &m_readback_pool) !=
+		        vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo alloc_info {};
+		alloc_info.commandPool        = m_readback_pool;
+		alloc_info.level              = vk::CommandBufferLevel::ePrimary;
+		alloc_info.commandBufferCount = 1;
+		EXIT_IF(device.allocateCommandBuffers(&alloc_info, &m_readback_command) !=
+		        vk::Result::eSuccess);
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		vk::SemaphoreCreateInfo semaphore_info {};
+		semaphore_info.pNext = &type_info;
+		EXIT_IF(device.createSemaphore(&semaphore_info, nullptr, &m_readback_semaphore) !=
+		        vk::Result::eSuccess);
+	}
 
-		while (slice_idx < slices.size()) {
-			const auto& slice              = slices[slice_idx];
-			const auto  aligned_slice_size = Common::AlignUp(slice.size, 64);
-			if (!batch_copies.empty() && batch_total_size + aligned_slice_size > MaxDownloadChunk) {
-				break;
-			}
-			batch_copies.emplace_back(slice.src_offset, batch_total_size, slice.size);
-			batch_total_size += aligned_slice_size;
-			++slice_idx;
+	const auto                  buffer_address = buffer.CpuAddress();
+	std::vector<vk::BufferCopy> batch;
+	size_t                      index = 0;
+	while (index < copies.size()) {
+		const uint64_t batch_total_size = NextDownloadBatch(copies, index, batch);
+		const auto [mapped, offset]     = m_download_buffer.Map(batch_total_size, 64);
+		if (mapped == nullptr) {
+			EXIT("BufferCache: download exceeds staging buffer capacity\n");
 		}
+		m_download_buffer.Commit();
+		for (auto& copy: batch) {
+			copy.dstOffset += offset;
+		}
+
+		const auto command = m_readback_command;
+		command.reset({});
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_IF(command.begin(&begin_info) != vk::Result::eSuccess);
+		// A barrier's first scope covers everything submitted earlier to this queue, including
+		// the already submitted command buffers that wrote this range.
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                        nullptr);
+		command.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+		                   static_cast<uint32_t>(batch.size()), batch.data());
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		after.buffer        = m_download_buffer.Handle();
+		after.offset        = offset;
+		after.size          = batch_total_size;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+		                        nullptr);
+		EXIT_IF(command.end() != vk::Result::eSuccess);
+
+		const uint64_t                  signal_value = ++m_readback_tick;
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues    = &signal_value;
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &command;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores    = &m_readback_semaphore;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			const auto        result = m_graphics.queue.submit(1, &submit_info, nullptr);
+			if (result != vk::Result::eSuccess) {
+				EXIT("BufferCache: readback submit failed: %s\n", vk::to_string(result).c_str());
+			}
+		}
+		vk::SemaphoreWaitInfo wait_info {};
+		wait_info.semaphoreCount = 1;
+		wait_info.pSemaphores    = &m_readback_semaphore;
+		wait_info.pValues        = &signal_value;
+		const auto wait_result   = device.waitSemaphores(&wait_info, UINT64_MAX);
+		if (wait_result != vk::Result::eSuccess) {
+			EXIT("BufferCache: readback wait failed: %s\n", vk::to_string(wait_result).c_str());
+		}
+
+		m_download_buffer.Invalidate(offset, batch_total_size);
+		for (const auto& copy: batch) {
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+	}
+	return true;
+}
+
+/**
+ * @brief Downloads GPU-modified buffer ranges back to CPU guest memory.
+ *
+ * Batches the collected transfers so they do not exceed staging buffer capacity, then defers
+ * invalidation and backing writeback.
+ *
+ * @param buffer Source GPU buffer to download from.
+ * @param vaddr Guest virtual address of the requested download range.
+ * @param size Size in bytes of the requested download range.
+ * @return true if any modified ranges were found and scheduled for download, false otherwise.
+ */
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
+		return false;
+	}
+
+	size_t index = 0;
+	while (index < copies.size()) {
+		std::vector<vk::BufferCopy> batch_copies;
+		const uint64_t batch_total_size = NextDownloadBatch(copies, index, batch_copies);
 
 		const auto [mapped, offset] = m_download_buffer.Map(batch_total_size, 64);
 		if (mapped == nullptr) {
@@ -264,12 +401,59 @@ BufferCache::~BufferCache() {
 		}
 	}
 	m_buffers.clear();
+	if (m_readback_pool != nullptr) {
+		m_graphics.device.destroySemaphore(m_readback_semaphore, nullptr);
+		m_graphics.device.destroyCommandPool(m_readback_pool, nullptr);
+	}
+}
+
+void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_known_fills_mutex);
+	const uint64_t  end = vaddr + size;
+	auto            it  = m_known_fills.lower_bound(vaddr);
+	if (it != m_known_fills.begin() && std::prev(it)->second.end > vaddr) {
+		--it;
+	}
+	while (it != m_known_fills.end() && it->first < end) {
+		const auto start = it->first;
+		const auto fill  = it->second;
+		it               = m_known_fills.erase(it);
+		// Keep the parts of a fill outside the forgotten range.
+		if (start < vaddr) {
+			m_known_fills.emplace(start, KnownFill {vaddr, fill.value});
+		}
+		if (fill.end > end) {
+			it = m_known_fills.emplace(end, KnownFill {fill.end, fill.value}).first;
+			++it;
+		}
+	}
+}
+
+void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	ForgetKnownFills(vaddr, size);
+	std::lock_guard lock(m_known_fills_mutex);
+	m_known_fills[vaddr] = KnownFill {vaddr + size, value};
+}
+
+bool BufferCache::TryGetKnownFill(uint64_t vaddr, uint64_t size, uint32_t* value) {
+	std::lock_guard lock(m_known_fills_mutex);
+	auto            it = m_known_fills.upper_bound(vaddr);
+	if (it == m_known_fills.begin()) {
+		return false;
+	}
+	--it;
+	if (it->first > vaddr || it->second.end < vaddr + size) {
+		return false;
+	}
+	*value = it->second.value;
+	return true;
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	ForgetKnownFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -294,11 +478,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end =
 		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		// Large reads (PPSA10595's stage select) exceed the 64 MiB staging buffer, so read back in
+		// chunks that each complete before the next reuses the staging space. Once one chunk has
+		// submitted the recording command buffer, the rest take the submitted-work path.
+		// Experiment switch: KYTY_SLOW_READBACK=1 always drains the recording command buffer.
+		static const bool  slow_readback = std::getenv("KYTY_SLOW_READBACK") != nullptr;
+		constexpr uint64_t ChunkSize     = 8 * 1024 * 1024;
+		for (uint64_t chunk = window_begin; chunk < window_end; chunk += ChunkSize) {
+			const auto chunk_size = std::min(ChunkSize, window_end - chunk);
+			if (!slow_readback && buffer.last_gpu_write_tick < m_scheduler.CurrentTick()) {
+				if (ReadbackSubmitted(buffer, chunk, chunk_size)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(chunk, chunk_size);
+				}
+			} else if (DownloadBufferMemory(buffer, chunk, chunk_size)) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+				m_memory_tracker.UnmarkRegionAsGpuModified(chunk, chunk_size);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -402,6 +599,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	// Merged contents are copied by the command buffer being recorded.
+	m_slot_buffers[id].last_gpu_write_tick = m_scheduler.CurrentTick();
 	Register(id);
 	return id;
 }
@@ -508,6 +707,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+		ForgetKnownFills(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -586,6 +787,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	RecordKnownFill(vaddr, size, value);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -663,6 +865,11 @@ void BufferCache::RunGarbageCollector() {
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
+	// All downloads queued here share the 64 MiB staging buffer within one command buffer, so
+	// keep a round's total below it. Dirty buffers that do not fit stay cached for a later round
+	// (PPSA10595's stage load retired more than 64 MiB at once and exited).
+	constexpr uint64_t DownloadBudget = 48ull * 1024 * 1024;
+	uint64_t           download_bytes = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
@@ -673,6 +880,10 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
+			if (buffer.Size() > DownloadBudget - download_bytes) {
+				return false;
+			}
+			download_bytes += buffer.Size();
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
