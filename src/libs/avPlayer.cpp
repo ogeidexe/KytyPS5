@@ -9,6 +9,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <thread>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -989,13 +990,15 @@ public:
 			return false;
 		}
 		auto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
-			if (deliver_seek_frame || sync_mode != 0) {
+			if (deliver_seek_frame) {
 				return true;
 			}
-			if (audio_id) {
+			// Without A/V sync the frames still keep to the player clock; handing one out on
+			// every call made playback speed depend on how often the title asks.
+			if (audio_id && sync_mode == 0) {
 				return candidate.info.time_stamp <= last_audio_ts;
 			}
-			auto now = CurrentTimeNoLock();
+			const auto now = CurrentTimeNoLock();
 			return now == 0 || candidate.info.time_stamp <= now;
 		});
 		if (!frame) {
@@ -1157,8 +1160,18 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		if (avcodec_parameters_to_context(c, s->codecpar) < 0) {
+			avcodec_free_context(&c);
+			return false;
+		}
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			// FFmpeg decodes on one thread unless told otherwise, which could not keep a 60 fps
+			// movie in real time (PPSA21567 intro: ~43 fps). Capped so the title keeps its cores.
+			const auto cores = std::thread::hardware_concurrency();
+			c->thread_count  = static_cast<int>(std::clamp(cores / 2u, 1u, 4u));
+			c->thread_type   = FF_THREAD_FRAME | FF_THREAD_SLICE;
+		}
+		if (avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}
@@ -1410,6 +1423,32 @@ private:
 		}
 		return ReceiveFrames(codec, timestamp_offset, buffers, frames, prepare, kind);
 	}
+	// The time video frames are due against: the audio handed to the game when video is synced to
+	// audio, otherwise the player clock.
+	uint64_t VideoReferenceTimeNoLock() const {
+		return audio_id && sync_mode == 0 ? last_audio_ts : CurrentTimeNoLock();
+	}
+	// Only a couple of output buffers exist and each is freed only when the game fetches the next
+	// frame, so decoding runs at the game's fetch rate. A title that renders slower than the
+	// movie (PPSA21567: a 60 fps intro fetched ~40 times a second) then plays the movie in slow
+	// motion while its separately played soundtrack runs on. Skip frames that are already late so
+	// the picture keeps to the clock.
+	bool IsLateVideoFrame(const AVFrame* frame, uint64_t timestamp_offset) {
+		constexpr uint64_t LateToleranceMs = 50;
+		const auto         pts =
+		    frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+		if (pts == AV_NOPTS_VALUE || !video_id) {
+			return false;
+		}
+		const uint64_t time_stamp =
+		    to_ms(pts, fmt->streams[video_id.value()]->time_base) + timestamp_offset;
+		std::lock_guard lock(mutex);
+		if (paused || seek_video_frame_pending) {
+			return false;
+		}
+		const uint64_t reference = VideoReferenceTimeNoLock();
+		return reference != 0 && time_stamp + LateToleranceMs < reference;
+	}
 	bool ReceiveFrames(AVCodecContext* codec, uint64_t timestamp_offset,
 	                   WorkQueue<std::unique_ptr<GuestBuffer>>& buffers,
 	                   WorkQueue<ReadyFrame>& frames, PrepareFrame prepare, const char* kind) {
@@ -1427,6 +1466,12 @@ private:
 				LOGF("\t avcodec_receive_frame %s failed: %s\n", kind, fferr(result).c_str());
 				av_frame_free(&frame);
 				return false;
+			}
+			if (&frames == &video_frames && IsLateVideoFrame(frame, timestamp_offset)) {
+				// Decoded (later frames depend on it) but never converted or queued, so it does
+				// not take one of the few output buffers.
+				av_frame_free(&frame);
+				continue;
 			}
 			auto buffer = buffers.WaitPop(worker_stop);
 			if (!buffer) {
