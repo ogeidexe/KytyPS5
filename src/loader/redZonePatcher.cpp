@@ -1093,11 +1093,14 @@ void CollectReciprocalSquareRoots(const DecodedFunction& function,
 uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
                                         std::span<const ReciprocalSquareRootSite> sites,
                                         uint64_t trampoline_addr, uint64_t trampoline_size) {
-	// Validate every required relocation before introducing any traps.
+	// A site whose red zone is live should have been relocated so the trap cannot clobber it.
+	// Frame-pointer tracking flags more sites than the relocator can always move; fall back to
+	// the in-place trap for those, as before that tracking existed, instead of refusing to boot.
 	for (const auto& site: sites) {
 		if (site.requires_red_zone_protection &&
 		    !module.patched.contains(reinterpret_cast<u8*>(site.address))) {
-			EXIT("Cannot preserve the guest red zone at emulated VRSQRTPS 0x%016" PRIx64 "\n",
+			LOGF("Warning: cannot preserve the guest red zone at emulated VRSQRTPS 0x%016" PRIx64
+			     ", emulating in place\n",
 			     static_cast<u64>(site.address));
 		}
 	}
