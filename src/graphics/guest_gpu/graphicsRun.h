@@ -63,6 +63,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  enqueue_time      = 0;
 	};
 
 	void              Enqueue(Submission submission);

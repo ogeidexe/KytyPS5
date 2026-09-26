@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 #include "common/assert.h"
+#include "common/frameStats.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -390,6 +391,9 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto queued                = SDL_GetAudioStreamQueued(port->stream);
 		if (queued < static_cast<int>(prepared_size)) {
+			if (port->queue_primed) {
+				Common::FrameStats::g_audio_underruns.fetch_add(1, std::memory_order_relaxed);
+			}
 			port->queue_primed = false;
 		}
 		while (queued > static_cast<int>(min_queued_size)) {
@@ -401,18 +405,25 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 			Common::Thread::SleepMicro(1000);
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
-		if (port->queue_primed) {
-			const auto next_time = port->last_output_time + buffer_us;
-			const auto now       = LibKernel::KernelGetProcessTime();
-			if (next_time > now) {
-				Common::Thread::SleepMicro(next_time - now);
-			}
-		}
+		// No extra time-based sleep here. The queue-depth wait above already paces the writer at
+		// exactly the rate the device consumes. Sleeping until last_output_time + buffer_us on top
+		// of it made every cycle one buffer period plus the call and wake-up overhead, so output
+		// ran slower than real time, drained the queue and underran every few seconds.
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		return false;
+	}
+	if (const auto bytes_per_second =
+	        static_cast<uint64_t>(BytesPerSample(port->format)) * output_channels * port->freq;
+	    bytes_per_second != 0) {
+		const auto queued_ms = static_cast<uint32_t>(
+		    static_cast<uint64_t>(SDL_GetAudioStreamQueued(port->stream)) * 1000 / bytes_per_second);
+		auto seen = Common::FrameStats::g_audio_queue_max_ms.load(std::memory_order_relaxed);
+		while (queued_ms > seen && !Common::FrameStats::g_audio_queue_max_ms.compare_exchange_weak(
+		                               seen, queued_ms, std::memory_order_relaxed)) {
+		}
 	}
 	if (blocking && !port->queue_primed &&
 	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {

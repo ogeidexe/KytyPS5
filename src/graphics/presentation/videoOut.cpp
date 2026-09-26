@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/frameStats.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -1161,6 +1162,15 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->flip_status.flipArg                  = r.flip_arg;
 	r.cfg->flip_status.currentBuffer            = r.index;
 	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+	if (const auto frequency = LibKernel::KernelGetProcessTimeCounterFrequency(); frequency != 0) {
+		const auto latency_us = static_cast<uint32_t>(
+		    (r.cfg->flip_status.processTimeCounter - r.submit_ptc) * 1000000 / frequency);
+		Common::FrameStats::StoreMax(Common::FrameStats::g_flip_latency_max_us, latency_us);
+		Common::FrameStats::g_flip_latency_sum_us.fetch_add(latency_us, std::memory_order_relaxed);
+		Common::FrameStats::g_flip_count.fetch_add(1, std::memory_order_relaxed);
+		Common::FrameStats::StoreMax(Common::FrameStats::g_flip_pending_max,
+		                             static_cast<uint32_t>(r.cfg->flip_status.flipPendingNum));
+	}
 	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
 		r.cfg->flip_status.gcQueueNum--;
 	}

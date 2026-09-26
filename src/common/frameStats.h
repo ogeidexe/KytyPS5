@@ -12,6 +12,22 @@ namespace Common::FrameStats {
 
 inline std::atomic<uint64_t> g_compile_us {0};
 inline std::atomic<uint32_t> g_compile_count {0};
+// Deepest audio output queue seen since the last report, and underruns in that window.
+inline std::atomic<uint32_t> g_audio_queue_max_ms {0};
+inline std::atomic<uint32_t> g_audio_underruns {0};
+// Video latency: longest wait of a guest submission before the GPU thread started it, and the
+// longest and summed time from a flip request to its presentation.
+inline std::atomic<uint32_t> g_submit_wait_max_us {0};
+inline std::atomic<uint32_t> g_flip_latency_max_us {0};
+inline std::atomic<uint64_t> g_flip_latency_sum_us {0};
+inline std::atomic<uint32_t> g_flip_count {0};
+inline std::atomic<uint32_t> g_flip_pending_max {0};
+
+inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
+	auto seen = target.load(std::memory_order_relaxed);
+	while (value > seen && !target.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+	}
+}
 inline std::atomic<uint32_t> g_image_creates {0};
 inline std::atomic<uint32_t> g_image_deletes {0};
 

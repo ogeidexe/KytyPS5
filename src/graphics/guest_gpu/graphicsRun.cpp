@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/frameStats.h"
 #include "common/timer.h"
 
 #include <cstdlib>
@@ -529,6 +530,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.enqueue_time = Common::Timer::QueryPerformanceCounter();
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -647,6 +649,10 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	if (first_slice) {
+		Common::FrameStats::StoreMax(
+		    Common::FrameStats::g_submit_wait_max_us,
+		    static_cast<uint32_t>((Common::Timer::QueryPerformanceCounter() - submission.enqueue_time) *
+		                          1000000 / Common::Timer::QueryPerformanceFrequency()));
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
