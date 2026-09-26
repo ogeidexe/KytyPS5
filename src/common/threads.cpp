@@ -273,6 +273,20 @@ void Thread::SleepNano(uint64_t nanos) {
 #endif
 }
 
+void Thread::SetHostName(const char* name) {
+	if (name == nullptr || *name == '\0') {
+		return;
+	}
+#ifdef KYTY_WIN_CS
+	const int length = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+	if (length > 0) {
+		std::wstring wide(static_cast<size_t>(length), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, name, -1, wide.data(), length);
+		SetThreadDescription(GetCurrentThread(), wide.c_str());
+	}
+#endif
+}
+
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }

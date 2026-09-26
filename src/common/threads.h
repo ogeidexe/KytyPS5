@@ -35,6 +35,9 @@ public:
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 
+	// Names the calling thread for host tools (debuggers, Process Explorer, profilers).
+	static void SetHostName(const char* name);
+
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
 	static std::string GetThreadId();

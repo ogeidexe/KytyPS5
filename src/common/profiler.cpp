@@ -1,6 +1,7 @@
 #include "common/profiler.h"
 
 #include "common/emulatorConfig.h"
+#include "common/threads.h"
 
 #include <algorithm>
 #include <common/TracyProtocol.hpp>
@@ -49,6 +50,7 @@ void EndBlock() {
 }
 
 void SetThreadName(const char* name) {
+	Common::Thread::SetHostName(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

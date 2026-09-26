@@ -3408,6 +3408,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	Common::Thread::SetHostName(thread->name.c_str());
 
 	ApplyHostThreadAffinity(thread);
 
