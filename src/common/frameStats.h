@@ -25,6 +25,14 @@ inline std::atomic<uint32_t> g_flip_pending_max {0};
 // Synchronous GPU-to-CPU buffer readbacks and the time spent waiting on them.
 inline std::atomic<uint32_t> g_readback_count {0};
 inline std::atomic<uint64_t> g_readback_wait_us {0};
+inline std::atomic<uint64_t> g_readback_bytes {0};
+// Indirect draws: total, whose arguments were GPU-written (a CPU read stalls), that turned out
+// to draw nothing, served from the speculation cache, and time stalled reading arguments.
+inline std::atomic<uint32_t> g_indirect_draws {0};
+inline std::atomic<uint32_t> g_indirect_gpu_written {0};
+inline std::atomic<uint32_t> g_indirect_zero {0};
+inline std::atomic<uint32_t> g_indirect_speculated {0};
+inline std::atomic<uint64_t> g_indirect_stall_us {0};
 
 inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
 	auto seen = target.load(std::memory_order_relaxed);

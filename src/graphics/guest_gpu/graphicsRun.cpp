@@ -33,6 +33,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -57,6 +58,25 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// Indirect draw arguments written by GPU compute (GPU-driven culling) can only be read on the CPU
+// after a synchronous readback that drains the queue. KYTY_SPECULATIVE_INDIRECT=N reuses the last
+// real read for up to N-1 draws from the same address before reading again. The values are ones
+// the title really produced, so a stale value costs at most N-1 frames of a wrong draw count
+// (an object popping in or out late), not invalid state. Unset (the default) always reads.
+struct IndirectArgsSpeculation {
+	std::array<uint32_t, 5> words {};
+	uint32_t                uses = 0;
+};
+
+static uint32_t SpeculativeIndirectInterval() {
+	static const uint32_t interval = [] {
+		const char* value = std::getenv("KYTY_SPECULATIVE_INDIRECT");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+		return n >= 2 && n <= 60 ? static_cast<uint32_t>(n) : 0u;
+	}();
+	return interval;
+}
 
 class GpuMutexLock final {
 public:
@@ -992,6 +1012,43 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t size) {
+	EXIT_IF(size > sizeof(IndirectArgsSpeculation::words));
+	// Only the GPU thread records draws, so the cache needs no lock.
+	static std::unordered_map<uint64_t, IndirectArgsSpeculation> speculation;
+
+	const bool gpu_written = m_renderer.GetBufferCache().IsRegionGpuModified(address, size) ||
+	                         m_renderer.GetTextureCache().IsRegionGpuModified(address, size);
+	Common::FrameStats::g_indirect_draws.fetch_add(1, std::memory_order_relaxed);
+	const auto interval = SpeculativeIndirectInterval();
+	if (gpu_written) {
+		Common::FrameStats::g_indirect_gpu_written.fetch_add(1, std::memory_order_relaxed);
+		if (interval != 0) {
+			if (auto it = speculation.find(address);
+			    it != speculation.end() && ++it->second.uses < interval) {
+				std::memcpy(dst, it->second.words.data(), size);
+				Common::FrameStats::g_indirect_speculated.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+
+	// A GPU-written range faults here and is read back synchronously.
+	const auto start = Common::Timer::QueryPerformanceCounter();
+	std::memcpy(dst, reinterpret_cast<const void*>(address), size);
+	if (gpu_written) {
+		Common::FrameStats::g_indirect_stall_us.fetch_add(
+		    (Common::Timer::QueryPerformanceCounter() - start) * 1000000 /
+		        Common::Timer::QueryPerformanceFrequency(),
+		    std::memory_order_relaxed);
+	}
+	if (interval != 0) {
+		auto& entry = speculation[address];
+		std::memcpy(entry.words.data(), dst, size);
+		entry.uses = 0;
+	}
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
@@ -1001,7 +1058,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		ReadIndirectArgs(&args, reinterpret_cast<uint64_t>(args_addr), sizeof(args));
+		if (args.vertex_count_per_instance == 0 || args.instance_count == 0) {
+			Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
+		}
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -1012,7 +1072,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
+	ReadIndirectArgs(&args, reinterpret_cast<uint64_t>(args_addr), sizeof(args));
+	if (args.index_count_per_instance == 0 || args.instance_count == 0) {
+		Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {

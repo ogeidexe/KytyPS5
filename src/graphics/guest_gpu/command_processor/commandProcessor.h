@@ -105,6 +105,9 @@ public:
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
+	// Reads indirect draw arguments, counting stalls on GPU-written ones and, when
+	// KYTY_SPECULATIVE_INDIRECT is set, serving them from the last real read.
+	void ReadIndirectArgs(void* dst, uint64_t address, uint32_t size);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       uint32_t draw_initiator, bool indexed);

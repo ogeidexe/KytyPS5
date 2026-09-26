@@ -184,6 +184,7 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	for (const auto& batch: SplitBufferDownload(ToDownloadRanges(collected),
 	                                            m_download_buffer.MaxReservation(), 64)) {
 		const auto [mapped, offset] = m_download_buffer.Map(batch.total_size, 64);
+		Common::FrameStats::g_readback_bytes.fetch_add(batch.total_size, std::memory_order_relaxed);
 		if (mapped == nullptr) {
 			EXIT("BufferCache: readback batch could not be staged\n");
 		}

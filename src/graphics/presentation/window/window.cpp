@@ -956,6 +956,14 @@ void WindowContext::UpdateTitle() {
 		    static_cast<double>(now - last_frame) * 1000.0 / static_cast<double>(frequency);
 		last_frame = now;
 		stats_frames++;
+		// KYTY_FRAME_TIMES_FILE=<path> also records every frame time, for percentiles.
+		static FILE* frame_times = [] {
+			const char* path = std::getenv("KYTY_FRAME_TIMES_FILE");
+			return path != nullptr ? std::fopen(path, "w") : nullptr;
+		}();
+		if (frame_times != nullptr) {
+			std::fprintf(frame_times, "%.3f\n", frame_ms);
+		}
 		worst_ms = std::max(worst_ms, frame_ms);
 		over_33ms += frame_ms > 33.4 ? 1 : 0;
 		over_100ms += frame_ms > 100.0 ? 1 : 0;
@@ -983,6 +991,14 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_flip_pending_max.exchange(0),
 			            Common::FrameStats::g_readback_count.exchange(0),
 			            Common::FrameStats::g_readback_wait_us.exchange(0) / 1000.0);
+			std::printf("[frame-stats]   readback_kb=%.1f indirect=%u gpu_written=%u zero=%u"
+			            " speculated=%u indirect_stall=%.1fms\n",
+			            Common::FrameStats::g_readback_bytes.exchange(0) / 1024.0,
+			            Common::FrameStats::g_indirect_draws.exchange(0),
+			            Common::FrameStats::g_indirect_gpu_written.exchange(0),
+			            Common::FrameStats::g_indirect_zero.exchange(0),
+			            Common::FrameStats::g_indirect_speculated.exchange(0),
+			            Common::FrameStats::g_indirect_stall_us.exchange(0) / 1000.0);
 			std::fflush(stdout);
 			stats_start  = now;
 			worst_ms     = 0.0;
