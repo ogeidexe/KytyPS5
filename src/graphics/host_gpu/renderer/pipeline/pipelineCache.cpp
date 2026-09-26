@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -101,6 +102,136 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 
 bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::TryClampRangeSize(address, size) != 0;
+}
+
+// Dependency trace of one shader resource (SRT) evaluation. MaterializeResources is a pure function
+// of the user data, the shader base and the guest memory it reads through three channels: direct
+// word reads, strict (GPU-clean) reads and range validation. The trace records every such access
+// with its result. If a later draw of the same program has identical user data and shader base and
+// every recorded access still returns the same result, the evaluation would repeat exactly, so the
+// outputs left in the cache entry by the previous evaluation are reused. Nothing is approximated.
+struct SrtTraceRecord {
+	enum class Kind : uint8_t { Raw, Strict, Validate };
+	Kind     kind;
+	bool     ok;
+	uint32_t word_count;
+	uint32_t first_word; // index into SrtTrace::words
+	uint64_t address;
+	uint64_t size;
+};
+
+struct SrtTrace {
+	bool                                         valid       = false;
+	uint64_t                                     key_hash    = 0;
+	uint64_t                                     shader_base = 0;
+	std::vector<uint32_t>                        user_data;
+	std::vector<SrtTraceRecord>                  records;
+	std::vector<uint32_t>                        words;
+	ShaderRecompiler::IR::ResourceSnapshot       resources;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+
+	void Clear() {
+		valid = false;
+		records.clear();
+		words.clear();
+	}
+	void Add(SrtTraceRecord::Kind kind, bool ok, uint64_t address, uint64_t size,
+	         std::span<const uint32_t> values) {
+		records.push_back({kind, ok, static_cast<uint32_t>(values.size()),
+		                   static_cast<uint32_t>(words.size()), address, size});
+		words.insert(words.end(), values.begin(), values.end());
+	}
+};
+
+// The trace being recorded. ProgramCache runs on the GPU thread only; a thread-local rather than
+// SrtRuntime::userdata because MaterializeResources swaps userdata for its own read capture.
+thread_local SrtTrace* g_srt_recording = nullptr;
+
+bool RecordStrictRead(void*, uint64_t address, std::span<uint32_t> values) {
+	const bool ok = ReadShaderGuestMemory(nullptr, address, values);
+	if (g_srt_recording != nullptr) {
+		g_srt_recording->Add(SrtTraceRecord::Kind::Strict, ok, address, values.size_bytes(),
+		                     ok ? std::span<const uint32_t>(values) : std::span<const uint32_t> {});
+	}
+	return ok;
+}
+
+bool RecordValidate(void*, uint64_t address, uint64_t size) {
+	const bool ok = ValidateShaderGuestMemoryRange(nullptr, address, size);
+	if (g_srt_recording != nullptr) {
+		g_srt_recording->Add(SrtTraceRecord::Kind::Validate, ok, address, size, {});
+	}
+	return ok;
+}
+
+void RecordRawRead(uint64_t address, uint32_t value) {
+	if (g_srt_recording != nullptr) {
+		g_srt_recording->Add(SrtTraceRecord::Kind::Raw, true, address, sizeof(value), {&value, 1});
+	}
+}
+
+// Re-runs every recorded access in order; true when each returns exactly what it returned before.
+bool SrtTraceStillValid(const SrtTrace& trace) {
+	std::array<uint32_t, 64> scratch {};
+	for (const auto& record: trace.records) {
+		const auto expected = std::span(trace.words).subspan(record.first_word, record.word_count);
+		switch (record.kind) {
+			case SrtTraceRecord::Kind::Raw: {
+				uint32_t word = 0;
+				// Same direct read the evaluation made, including any fault-driven readback.
+				std::memcpy(&word, reinterpret_cast<const void*>(record.address), sizeof(word));
+				if (word != expected[0]) {
+					return false;
+				}
+				break;
+			}
+			case SrtTraceRecord::Kind::Strict: {
+				const auto count = record.size / sizeof(uint32_t);
+				if (count > scratch.size()) {
+					return false;
+				}
+				const bool ok =
+				    ReadShaderGuestMemory(nullptr, record.address, std::span(scratch).first(count));
+				if (ok != record.ok ||
+				    (ok && !std::equal(expected.begin(), expected.end(), scratch.begin()))) {
+					return false;
+				}
+				break;
+			}
+			case SrtTraceRecord::Kind::Validate:
+				if (ValidateShaderGuestMemoryRange(nullptr, record.address, record.size) !=
+				    record.ok) {
+					return false;
+				}
+				break;
+		}
+	}
+	return true;
+}
+
+bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                  const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+	       a.uniform_fill == b.uniform_fill;
+}
+
+bool SrtCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_CACHE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_SRT_CACHE_VERIFY=N re-evaluates every Nth cache hit and compares it with the cached result.
+uint32_t SrtCacheVerifyInterval() {
+	static const uint32_t interval = [] {
+		const char* value = std::getenv("KYTY_SRT_CACHE_VERIFY");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+		return static_cast<uint32_t>(std::min<unsigned long>(n, 1000000));
+	}();
+	return interval;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -211,6 +342,12 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
+		// Dependency traces of past evaluations, direct-mapped by a hash of the evaluation inputs:
+		// one program is drawn for many objects per frame, each with its own user data.
+		std::vector<SrtTrace>                       srt_traces;
+		uint32_t                                    srt_current  = UINT32_MAX; // outputs held
+		bool                                        srt_disabled = false; // verification mismatch
+		uint32_t                                    srt_hits_since_verify = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -271,6 +408,91 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// MaterializeResources for a draw, skipped when the entry's dependency trace shows the previous
+	// evaluation (whose outputs are still in the entry) would repeat exactly.
+	static void Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                        uint64_t program_hash) {
+		constexpr uint32_t Slots   = 256;
+		const bool         enabled = SrtCacheEnabled() && !entry.srt_disabled;
+		SrtTrace*          trace   = nullptr;
+		uint32_t           slot    = 0;
+		if (enabled) {
+			if (entry.srt_traces.empty()) {
+				entry.srt_traces.resize(Slots);
+			}
+			const uint64_t key_hash =
+			    XXH3_64bits_withSeed(runtime.user_data.data(), runtime.user_data.size_bytes(),
+			                         runtime.shader_base);
+			slot  = static_cast<uint32_t>(key_hash & (Slots - 1u));
+			trace = &entry.srt_traces[slot];
+			const bool same_inputs = trace->valid && trace->key_hash == key_hash &&
+			                         trace->shader_base == runtime.shader_base &&
+			                         std::ranges::equal(trace->user_data, runtime.user_data);
+			if (!same_inputs) {
+				Common::FrameStats::g_srt_miss_inputs.fetch_add(1, std::memory_order_relaxed);
+			} else if (!SrtTraceStillValid(*trace)) {
+				Common::FrameStats::g_srt_miss_memory.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				Common::FrameStats::g_srt_hits.fetch_add(1, std::memory_order_relaxed);
+				Common::FrameStats::g_srt_checked_reads.fetch_add(trace->records.size(),
+				                                                  std::memory_order_relaxed);
+				if (entry.srt_current != slot) {
+					entry.resources      = trace->resources;
+					entry.specialization = trace->specialization;
+					entry.srt_current    = slot;
+				}
+				const auto verify = SrtCacheVerifyInterval();
+				if (verify == 0 || ++entry.srt_hits_since_verify < verify) {
+					return;
+				}
+				entry.srt_hits_since_verify = 0;
+				ShaderRecompiler::IR::ResourceSnapshot       fresh;
+				ShaderRecompiler::IR::ResourceSpecialization fresh_specialization;
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
+				                                                    fresh, fresh_specialization));
+				if (SameSnapshot(fresh, entry.resources) &&
+				    fresh_specialization == entry.specialization) {
+					return;
+				}
+				Common::FrameStats::g_srt_mismatches.fetch_add(1, std::memory_order_relaxed);
+				std::printf("SRT CACHE MISMATCH: program=0x%016" PRIx64 " base=0x%016" PRIx64
+				            " user_data=%zu recorded_reads=%zu; caching disabled for this program\n",
+				            program_hash, runtime.shader_base, runtime.user_data.size(),
+				            trace->records.size());
+				entry.srt_disabled = true;
+				entry.srt_traces.clear();
+				entry.srt_current    = UINT32_MAX;
+				entry.resources      = std::move(fresh);
+				entry.specialization = std::move(fresh_specialization);
+				return;
+			}
+			trace->Clear();
+			trace->key_hash    = key_hash;
+			trace->shader_base = runtime.shader_base;
+			trace->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		}
+
+		Common::FrameStats::g_srt_evaluations.fetch_add(1, std::memory_order_relaxed);
+		auto recording = runtime;
+		if (trace != nullptr) {
+			recording.read_specialization_memory = RecordStrictRead;
+			recording.validate_memory_range      = RecordValidate;
+			recording.observe_raw_read           = RecordRawRead;
+			g_srt_recording                      = trace;
+		}
+		const bool ok = ShaderRecompiler::IR::MaterializeResources(
+		    entry.resource_plan, recording, entry.resources, entry.specialization);
+		g_srt_recording = nullptr;
+		EXIT_IF(!ok);
+		entry.srt_current = UINT32_MAX;
+		if (trace != nullptr) {
+			trace->resources      = entry.resources;
+			trace->specialization = entry.specialization;
+			trace->valid          = true;
+			entry.srt_current     = slot;
+		}
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -301,9 +523,7 @@ struct PipelineCache::ProgramCache {
 			.validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			Materialize(entry->second, runtime, params.hash);
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations,
 			        [&](const Permutation& candidate) {
@@ -369,9 +589,7 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			Materialize(entry->second, runtime, params.hash);
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));

@@ -19,6 +19,9 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	SrtMemoryRangeValidator   validate_memory_range      = nullptr;
+	// Told about every word read directly from guest memory (the read_memory == nullptr path).
+	// It observes only and cannot change the value, so evaluation is unaffected.
+	void (*observe_raw_read)(uint64_t address, uint32_t value) = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

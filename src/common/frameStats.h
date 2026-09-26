@@ -33,6 +33,14 @@ inline std::atomic<uint32_t> g_indirect_gpu_written {0};
 inline std::atomic<uint32_t> g_indirect_zero {0};
 inline std::atomic<uint32_t> g_indirect_speculated {0};
 inline std::atomic<uint64_t> g_indirect_stall_us {0};
+// Shader resource (SRT) evaluation: full evaluations, cache hits, misses by cause, recorded
+// dependency reads re-checked on hits, and verification mismatches (must stay 0).
+inline std::atomic<uint32_t> g_srt_evaluations {0};
+inline std::atomic<uint32_t> g_srt_hits {0};
+inline std::atomic<uint32_t> g_srt_miss_inputs {0};
+inline std::atomic<uint32_t> g_srt_miss_memory {0};
+inline std::atomic<uint64_t> g_srt_checked_reads {0};
+inline std::atomic<uint32_t> g_srt_mismatches {0};
 
 inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
 	auto seen = target.load(std::memory_order_relaxed);
