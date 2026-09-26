@@ -82,6 +82,10 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Flush for an end-of-pipe interrupt. Coalesces a burst of interrupts into one submit; the
+	// pending work still goes out at the next real flush, which the PM4 loop issues whenever a
+	// submission completes or suspends on a wait.
+	void            BufferFlushEvent();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -202,6 +206,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	uint32_t  m_deferred_event_flushes      = 0;
+	uint64_t  m_deferred_event_since        = 0;
 };
 
 } // namespace Libs::Graphics

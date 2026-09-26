@@ -4,6 +4,9 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
+
+#include <cstdlib>
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -265,7 +268,32 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	m_deferred_event_flushes = 0;
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::BufferFlushEvent() {
+	// Some titles raise hundreds of end-of-pipe interrupts per frame (PPSA21567: ~300), and a
+	// submit per interrupt made vkQueueSubmit the largest cost on the GPU thread. Batch them,
+	// bounded in count and time so a waiting CPU thread still hears back quickly.
+	// KYTY_EVENT_FLUSH_BATCH=1 restores one submit per interrupt.
+	static const uint32_t max_batch = [] {
+		const char* value = std::getenv("KYTY_EVENT_FLUSH_BATCH");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+		return n >= 1 && n <= 256 ? static_cast<uint32_t>(n) : 16u;
+	}();
+	constexpr uint64_t MaxDelayUs = 250;
+
+	const auto now = Common::Timer::QueryPerformanceCounter();
+	if (m_deferred_event_flushes == 0) {
+		m_deferred_event_since = now;
+	}
+	++m_deferred_event_flushes;
+	const auto waited_us = (now - m_deferred_event_since) * 1000000 /
+	                       Common::Timer::QueryPerformanceFrequency();
+	if (m_deferred_event_flushes >= max_batch || waited_us >= MaxDelayUs) {
+		BufferFlush();
+	}
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -745,6 +773,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+		}
+		if (m_deferred_event_flushes != 0) {
+			// Bound the latency of coalesced interrupts (see BufferFlushEvent) even when no
+			// further interrupt arrives to trigger the flush.
+			const auto waited_us =
+			    (Common::Timer::QueryPerformanceCounter() - m_deferred_event_since) * 1000000 /
+			    Common::Timer::QueryPerformanceFrequency();
+			if (waited_us >= 250) {
+				BufferFlush();
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
