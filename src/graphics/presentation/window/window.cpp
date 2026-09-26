@@ -8,6 +8,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/systemInfo.h"
@@ -26,6 +27,8 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <cinttypes>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -938,6 +941,39 @@ void WindowContext::UpdateTitle() {
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+
+	// KYTY_FRAME_STATS=1 logs frame pacing once per second: the worst frame and how many
+	// frames missed 30 and 10 fps. Averages hide stutter; these counts do not.
+	static const bool frame_stats = std::getenv("KYTY_FRAME_STATS") != nullptr;
+	if (frame_stats) {
+		static uint64_t last_frame   = now;
+		static uint64_t stats_start  = now;
+		static double   worst_ms     = 0.0;
+		static uint32_t over_33ms    = 0;
+		static uint32_t over_100ms   = 0;
+		static uint32_t stats_frames = 0;
+		const double    frame_ms =
+		    static_cast<double>(now - last_frame) * 1000.0 / static_cast<double>(frequency);
+		last_frame = now;
+		stats_frames++;
+		worst_ms = std::max(worst_ms, frame_ms);
+		over_33ms += frame_ms > 33.4 ? 1 : 0;
+		over_100ms += frame_ms > 100.0 ? 1 : 0;
+		if (now - stats_start >= frequency) {
+			const auto compile_us = Common::FrameStats::g_compile_us.exchange(0);
+			const auto compiles   = Common::FrameStats::g_compile_count.exchange(0);
+			LOGF("[frame-stats] frame=%" PRIu64 " frames=%u worst=%.1fms over33=%u over100=%u"
+			     " compiles=%u compile=%.1fms\n",
+			     frame_num, stats_frames, worst_ms, over_33ms, over_100ms, compiles,
+			     static_cast<double>(compile_us) / 1000.0);
+			stats_start  = now;
+			worst_ms     = 0.0;
+			over_33ms    = 0;
+			over_100ms   = 0;
+			stats_frames = 0;
+		}
+	}
+
 	frame_num++;
 	fps_frames++;
 	if (now - fps_start >= frequency) {

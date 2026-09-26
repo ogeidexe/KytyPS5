@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/frameStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -246,6 +247,7 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		Common::FrameStats::CompileScope compile_scope;
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
