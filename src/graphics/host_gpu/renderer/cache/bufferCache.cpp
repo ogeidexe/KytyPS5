@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferDownloadBatch.h"
 
 #include "common/alignment.h"
+#include "common/frameStats.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -245,7 +246,13 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		wait_info.semaphoreCount = 1;
 		wait_info.pSemaphores    = &m_readback_semaphore;
 		wait_info.pValues        = &signal_value;
+		const auto wait_start    = Common::Timer::QueryPerformanceCounter();
 		const auto wait_result   = device.waitSemaphores(&wait_info, UINT64_MAX);
+		Common::FrameStats::g_readback_count.fetch_add(1, std::memory_order_relaxed);
+		Common::FrameStats::g_readback_wait_us.fetch_add(
+		    (Common::Timer::QueryPerformanceCounter() - wait_start) * 1000000 /
+		        Common::Timer::QueryPerformanceFrequency(),
+		    std::memory_order_relaxed);
 		if (wait_result != vk::Result::eSuccess) {
 			EXIT("BufferCache: readback wait failed: %s\n", vk::to_string(wait_result).c_str());
 		}

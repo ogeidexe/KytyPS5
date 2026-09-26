@@ -976,11 +976,13 @@ void WindowContext::UpdateTitle() {
 			const auto flips = Common::FrameStats::g_flip_count.exchange(0);
 			const auto flip_sum_us = Common::FrameStats::g_flip_latency_sum_us.exchange(0);
 			std::printf("[frame-stats]   submit_wait_max=%.1fms flip_latency avg=%.1fms max=%.1fms"
-			            " flip_pending_max=%u\n",
+			            " flip_pending_max=%u readbacks=%u readback_wait=%.1fms\n",
 			            Common::FrameStats::g_submit_wait_max_us.exchange(0) / 1000.0,
 			            flips != 0 ? static_cast<double>(flip_sum_us) / flips / 1000.0 : 0.0,
 			            Common::FrameStats::g_flip_latency_max_us.exchange(0) / 1000.0,
-			            Common::FrameStats::g_flip_pending_max.exchange(0));
+			            Common::FrameStats::g_flip_pending_max.exchange(0),
+			            Common::FrameStats::g_readback_count.exchange(0),
+			            Common::FrameStats::g_readback_wait_us.exchange(0) / 1000.0);
 			std::fflush(stdout);
 			stats_start  = now;
 			worst_ms     = 0.0;
