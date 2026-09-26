@@ -41,6 +41,15 @@ inline std::atomic<uint32_t> g_srt_miss_inputs {0};
 inline std::atomic<uint32_t> g_srt_miss_memory {0};
 inline std::atomic<uint64_t> g_srt_checked_reads {0};
 inline std::atomic<uint32_t> g_srt_mismatches {0};
+// Guest-CPU reads of GPU-written memory (a game thread faults and the GPU thread reads back):
+// count, time waiting for the GPU thread to service the request, time spent reading back, how
+// often the buffer's last GPU writer had already completed, and how often the open command buffer
+// had to be flushed because the writer was still in it.
+inline std::atomic<uint32_t> g_cpu_reads {0};
+inline std::atomic<uint64_t> g_cpu_read_service_us {0};
+inline std::atomic<uint64_t> g_cpu_read_readback_us {0};
+inline std::atomic<uint32_t> g_cpu_read_producer_done {0};
+inline std::atomic<uint32_t> g_cpu_read_flushes {0};
 
 inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
 	auto seen = target.load(std::memory_order_relaxed);

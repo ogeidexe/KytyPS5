@@ -447,11 +447,40 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const bool guest_cpu     = !GuestGpu::IsGpuThread();
+	const auto request_start = Common::Timer::QueryPerformanceCounter();
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, guest_cpu,
+	                                                request_start] {
+		const auto service_start = Common::Timer::QueryPerformanceCounter();
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		if (guest_cpu) {
+			m_scheduler.GetMasterSemaphore().Refresh();
+			const auto freq = Common::Timer::QueryPerformanceFrequency();
+			Common::FrameStats::g_cpu_reads.fetch_add(1, std::memory_order_relaxed);
+			Common::FrameStats::g_cpu_read_service_us.fetch_add(
+			    (service_start - request_start) * 1000000 / freq, std::memory_order_relaxed);
+			if (m_scheduler.GetMasterSemaphore().IsFree(buffer.last_gpu_write_tick)) {
+				Common::FrameStats::g_cpu_read_producer_done.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (buffer.last_gpu_write_tick >= m_scheduler.CurrentTick()) {
+				Common::FrameStats::g_cpu_read_flushes.fetch_add(1, std::memory_order_relaxed);
+			}
+			static uint32_t dumped = 0;
+			if (dumped < 4 && (vaddr >> 12) == (0x555f41dd0ull >> 12)) {
+				dumped++;
+				std::printf("[dep-trace] read=0x%llx buffer=[0x%llx,+0x%llx) writer_tick=%llu "
+				            "current_tick=%llu gpu_done_tick=%llu gpu_modified_in_window=%d\n",
+				            (unsigned long long)vaddr, (unsigned long long)buffer.CpuAddress(),
+				            (unsigned long long)buffer.Size(),
+				            (unsigned long long)buffer.last_gpu_write_tick,
+				            (unsigned long long)m_scheduler.CurrentTick(),
+				            (unsigned long long)m_scheduler.GetMasterSemaphore().KnownGpuTick(),
+				            IsRegionGpuModified(vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0);
+			}
+		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
 		constexpr uint64_t WindowSize   = 512 * 1024;
@@ -482,6 +511,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+		if (guest_cpu) {
+			Common::FrameStats::g_cpu_read_readback_us.fetch_add(
+			    (Common::Timer::QueryPerformanceCounter() - service_start) * 1000000 /
+			        Common::Timer::QueryPerformanceFrequency(),
+			    std::memory_order_relaxed);
 		}
 	});
 }
