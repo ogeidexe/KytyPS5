@@ -1,5 +1,10 @@
 #include "path_util.h"
 
+// Defines KYTY_PLATFORM. Without it both platform macros are undefined, every
+// "KYTY_PLATFORM == KYTY_PLATFORM_LINUX" test compares 0 == 0, and the Linux paths
+// (and getenv("HOME")) end up in the Windows build.
+#include "common/config.h"
+
 #include <cstdlib>
 #include <filesystem>
 
@@ -14,7 +19,9 @@ static constexpr auto texture_dir        = "_Textures/";
 
 static inline std::filesystem::path GetUserPath() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	return std::filesystem::path(std::getenv("HOME")) / ".local/share/kyty";
+	if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+		return std::filesystem::path(home) / ".local/share/kyty";
+	}
 #endif
 	return "";
 }
