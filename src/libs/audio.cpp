@@ -387,7 +387,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
+		// Up to 96 buffers so KYTY_AUDIO_LATENCY_MS can actually reach its 1000 ms limit (the old
+		// cap of 16 silently stopped at ~171 ms for 512-sample ports). A larger delay lines sound
+		// up with a picture that runs late when the emulated frame rate is low.
+		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 96u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto queued                = SDL_GetAudioStreamQueued(port->stream);
 		if (queued < static_cast<int>(prepared_size)) {
