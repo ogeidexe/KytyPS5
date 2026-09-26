@@ -1,7 +1,5 @@
 #include "common/exfatImage.h"
 
-#include "common/stringUtils.h"
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -21,6 +19,44 @@ uint32_t U32(const uint8_t* p) {
 
 uint64_t U64(const uint8_t* p) {
 	return uint64_t(U32(p)) | (uint64_t(U32(p + 4)) << 32);
+}
+
+// Directory entry names come straight off the disk image, so a corrupt image can produce lone
+// or out-of-order surrogates. Common::Utf16ToUtf8() throws on that, and this library is built
+// with exceptions disabled; decode by hand and reject the entry instead of crashing.
+bool TryUtf16ToUtf8(std::u16string_view utf16, std::string* out) {
+	out->clear();
+	for (size_t i = 0; i < utf16.size(); ++i) {
+		uint32_t cp = utf16[i];
+		if (cp >= 0xd800 && cp <= 0xdbff) {
+			if (i + 1 >= utf16.size()) {
+				return false;
+			}
+			const uint32_t low = utf16[++i];
+			if (low < 0xdc00 || low > 0xdfff) {
+				return false;
+			}
+			cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+		} else if (cp >= 0xdc00 && cp <= 0xdfff) {
+			return false;
+		}
+		if (cp <= 0x7f) {
+			out->push_back(static_cast<char>(cp));
+		} else if (cp <= 0x7ff) {
+			out->push_back(static_cast<char>(0xc0 | (cp >> 6)));
+			out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+		} else if (cp <= 0xffff) {
+			out->push_back(static_cast<char>(0xe0 | (cp >> 12)));
+			out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+			out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+		} else {
+			out->push_back(static_cast<char>(0xf0 | (cp >> 18)));
+			out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+			out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+			out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+		}
+	}
+	return true;
 }
 
 bool SameName(std::string_view a, std::string_view b) {
@@ -262,9 +298,7 @@ bool ExfatImage::ReadDirectory(const Entry& directory, std::vector<Entry>* entri
 			return false;
 		}
 		Entry entry;
-		try {
-			entry.name = Utf16ToUtf8(name);
-		} catch (...) {
+		if (!TryUtf16ToUtf8(name, &entry.name)) {
 			return false;
 		}
 		if (entry.name == "." || entry.name == ".." ||
