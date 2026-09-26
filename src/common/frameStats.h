@@ -50,6 +50,11 @@ inline std::atomic<uint64_t> g_cpu_read_service_us {0};
 inline std::atomic<uint64_t> g_cpu_read_readback_us {0};
 inline std::atomic<uint32_t> g_cpu_read_producer_done {0};
 inline std::atomic<uint32_t> g_cpu_read_flushes {0};
+// Eager write-back of hot pages: copies scheduled, pages unprotected after write-back, and
+// KYTY_DEP_VERIFY mismatches between written-back and GPU data (must stay 0).
+inline std::atomic<uint32_t> g_eager_scheduled {0};
+inline std::atomic<uint32_t> g_eager_retired {0};
+inline std::atomic<uint32_t> g_dep_mismatches {0};
 
 inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
 	auto seen = target.load(std::memory_order_relaxed);

@@ -77,6 +77,11 @@ public:
 	[[nodiscard]] bool TryGetKnownFill(uint64_t vaddr, uint64_t size, uint32_t* value);
 	// Records that the GPU work recorded last filled [vaddr, vaddr + size) with value.
 	void RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// Guest threads that fault on GPU-written memory mark its page hot. Before each submit, pending
+	// GPU writes to hot pages are copied out in the same command buffer and written back on
+	// completion, after which the page is unprotected: the next guest read needs no fault, no
+	// GPU-thread round trip and no wait. Runs on the GPU thread.
+	void               WriteBackHotPages();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -148,6 +153,10 @@ private:
 	vk::CommandBuffer m_readback_command   = nullptr;
 	vk::Semaphore     m_readback_semaphore = nullptr;
 	uint64_t          m_readback_tick      = 0;
+	// Hot page (4 KiB aligned) -> tick of its in-flight eager write-back, 0 when none.
+	std::map<uint64_t, uint64_t> m_hot_pages;
+	void RetireHotPages(uint64_t vaddr, uint64_t size, bool wait);
+	bool VerifyWrittenBack(uint64_t page);
 
 	struct KnownFill {
 		uint64_t end;

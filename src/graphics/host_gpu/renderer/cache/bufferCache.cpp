@@ -490,6 +490,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end =
 		    std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		if (guest_cpu && m_hot_pages.size() < 256) {
+			m_hot_pages.try_emplace(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), 0);
+		}
+		// An eager write-back in flight has already taken its bytes out of the dirty ranges, so
+		// finish it (and unprotect what it covered) before looking for anything left to read.
+		RetireHotPages(window_begin, window_end - window_begin, true);
+
 		// Large reads (PPSA10595's stage select) exceed the 64 MiB staging buffer, so read back in
 		// chunks that each complete before the next reuses the staging space. Once one chunk has
 		// submitted the recording command buffer, the rest take the submitted-work path.
@@ -519,6 +526,128 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::memory_order_relaxed);
 		}
 	});
+}
+
+static bool DepVerifyEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEP_VERIFY") != nullptr;
+	return enabled;
+}
+
+static bool EagerWriteBackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EAGER_WRITEBACK");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::WriteBackHotPages() {
+	if (m_hot_pages.empty() || !EagerWriteBackEnabled()) {
+		return;
+	}
+	RetireHotPages(0, UINT64_MAX, false);
+	for (auto& [page, inflight]: m_hot_pages) {
+		if (inflight != 0 || !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		const auto id = FindBuffer(page, 1);
+		if (IsBufferInvalid(id)) {
+			continue;
+		}
+		auto&      buffer = m_slot_buffers[id];
+		const auto begin  = std::max(page, buffer.CpuAddress());
+		const auto end    = std::min(page + TRACKER_PAGE_SIZE, buffer.CpuAddress() + buffer.Size());
+		if (begin < end && DownloadBufferMemory(buffer, begin, end - begin)) {
+			// The copy and its deferred write-back belong to the command buffer about to be
+			// submitted as this tick.
+			inflight = m_scheduler.CurrentTick();
+			Common::FrameStats::g_eager_scheduled.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+void BufferCache::RetireHotPages(uint64_t vaddr, uint64_t size, bool wait) {
+	auto&      master = m_scheduler.GetMasterSemaphore();
+	const auto end    = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	master.Refresh();
+	for (auto it = m_hot_pages.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+	     it != m_hot_pages.end() && it->first < end; ++it) {
+		auto& [page, inflight] = *it;
+		if (inflight == 0) {
+			continue;
+		}
+		if (!master.IsFree(inflight) || !m_scheduler.PriorityOperationsDone(inflight)) {
+			if (!wait) {
+				continue;
+			}
+			m_scheduler.Wait(inflight);
+			m_scheduler.WaitPriorityOperations(inflight);
+		}
+		inflight = 0;
+		// A newer GPU write landed after the copy was recorded: stay protected; its bytes are
+		// written back by a later pass or read back on demand.
+		if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		if (DepVerifyEnabled() && !VerifyWrittenBack(page)) {
+			continue;
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		Common::FrameStats::g_eager_retired.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// KYTY_DEP_VERIFY: before unprotecting a written-back page, read the same bytes straight from the
+// GPU buffer (a full synchronous readback, the old conservative path) and compare.
+bool BufferCache::VerifyWrittenBack(uint64_t page) {
+	const auto id = FindBuffer(page, 1);
+	if (IsBufferInvalid(id)) {
+		return true;
+	}
+	auto&      buffer = m_slot_buffers[id];
+	const auto begin  = std::max(page, buffer.CpuAddress());
+	const auto end    = std::min(page + TRACKER_PAGE_SIZE, buffer.CpuAddress() + buffer.Size());
+	const auto size   = end - begin;
+	m_scheduler.Finish();
+	const auto [mapped, offset] = m_download_buffer.Map(size, 64);
+	EXIT_IF(mapped == nullptr);
+	m_download_buffer.Commit();
+	auto&                   command = m_scheduler.Current();
+	vk::BufferCopy          copy {begin - buffer.CpuAddress(), offset, size};
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = buffer.Handle();
+	barrier.offset              = 0;
+	barrier.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barrier, 0,
+	                       nullptr);
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(), 1, &copy);
+	m_scheduler.Finish();
+	m_download_buffer.Invalidate(offset, size);
+	std::vector<uint8_t> backing(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(begin, backing.data(), size)) {
+		return true;
+	}
+	if (std::memcmp(backing.data(), mapped, size) == 0) {
+		return true;
+	}
+	size_t first = 0;
+	while (first < size && backing[first] == mapped[first]) {
+		++first;
+	}
+	Common::FrameStats::g_dep_mismatches.fetch_add(1, std::memory_order_relaxed);
+	std::printf("GPU DEPENDENCY MISMATCH: page=0x%016" PRIx64 " buffer=[0x%016" PRIx64
+	            ",+0x%" PRIx64 ") first_diff=+0x%zx written_back=0x%02x gpu=0x%02x "
+	            "last_gpu_write_tick=%" PRIu64 " gpu_done_tick=%" PRIu64 "\n",
+	            page, buffer.CpuAddress(), buffer.Size(), first, backing[first], mapped[first],
+	            buffer.last_gpu_write_tick, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	return false;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

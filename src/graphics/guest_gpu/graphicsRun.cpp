@@ -290,6 +290,7 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	m_deferred_event_flushes = 0;
+	m_renderer.GetBufferCache().WriteBackHotPages();
 	GetScheduler().Flush();
 }
 

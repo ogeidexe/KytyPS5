@@ -1009,12 +1009,16 @@ void WindowContext::UpdateTitle() {
 			                Common::FrameStats::g_srt_checked_reads.exchange(0)),
 			            Common::FrameStats::g_srt_mismatches.exchange(0));
 			std::printf("[frame-stats]   cpu_reads=%u cpu_read_service=%.1fms cpu_read_readback=%.1fms"
-			            " producer_done=%u needed_flush=%u\n",
+			            " producer_done=%u needed_flush=%u eager_scheduled=%u eager_retired=%u"
+			            " dep_mismatches=%u\n",
 			            Common::FrameStats::g_cpu_reads.exchange(0),
 			            Common::FrameStats::g_cpu_read_service_us.exchange(0) / 1000.0,
 			            Common::FrameStats::g_cpu_read_readback_us.exchange(0) / 1000.0,
 			            Common::FrameStats::g_cpu_read_producer_done.exchange(0),
-			            Common::FrameStats::g_cpu_read_flushes.exchange(0));
+			            Common::FrameStats::g_cpu_read_flushes.exchange(0),
+			            Common::FrameStats::g_eager_scheduled.exchange(0),
+			            Common::FrameStats::g_eager_retired.exchange(0),
+			            Common::FrameStats::g_dep_mismatches.exchange(0));
 			std::fflush(stdout);
 			stats_start  = now;
 			worst_ms     = 0.0;
