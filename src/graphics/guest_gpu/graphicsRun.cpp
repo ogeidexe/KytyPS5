@@ -71,7 +71,13 @@ struct DrawIndexedIndirectArgs {
 struct IndirectArgsSpeculation {
 	std::array<uint32_t, 5> words {};
 	uint32_t                uses = 0;
+	// Consecutive real reads that returned exactly the previous real read. Speculation only
+	// starts once the arguments have proven stable, and any change seen on a refresh drops back
+	// to real reads, so a title whose GPU-generated counts vary is simply never guessed at.
+	uint32_t                stable = 0;
 };
+
+constexpr uint32_t SpeculationMinStableReads = 3;
 
 static uint32_t SpeculativeIndirectInterval() {
 	static const uint32_t interval = [] {
@@ -1033,7 +1039,8 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 		Common::FrameStats::g_indirect_gpu_written.fetch_add(1, std::memory_order_relaxed);
 		if (interval != 0) {
 			if (auto it = speculation.find(address);
-			    it != speculation.end() && ++it->second.uses < interval) {
+			    it != speculation.end() && it->second.stable >= SpeculationMinStableReads &&
+			    ++it->second.uses < interval) {
 				std::memcpy(dst, it->second.words.data(), size);
 				Common::FrameStats::g_indirect_speculated.fetch_add(1, std::memory_order_relaxed);
 				return;
@@ -1051,7 +1058,9 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 		    std::memory_order_relaxed);
 	}
 	if (interval != 0) {
-		auto& entry = speculation[address];
+		auto&      entry = speculation[address];
+		const bool same  = std::memcmp(entry.words.data(), dst, size) == 0;
+		entry.stable     = same ? entry.stable + 1 : 0;
 		std::memcpy(entry.words.data(), dst, size);
 		entry.uses = 0;
 	}
