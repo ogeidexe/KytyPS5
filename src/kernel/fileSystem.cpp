@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <random>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
@@ -281,6 +282,26 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+namespace {
+// Games routinely probe for sequences of variant files that don't exist (e.g. "icon~~0.odx",
+// "icon~~1.odx", ...) to discover how many there are. Each miss used to fall through to a full
+// case-insensitive directory scan below, so probing a few hundred non-existent variants in one
+// directory cost a few hundred full listings of it. Cache each directory's case-folded listing,
+// keyed by the directory's own last-write time: any real change updates that automatically (the
+// emulator is the only writer during a session), so a stale cache entry can't hide a new file.
+struct DirectoryListingCache {
+	std::filesystem::file_time_type                        mtime {};
+	std::unordered_map<std::string, std::filesystem::path> by_lower_name;
+};
+
+// Only ever touched from ResolvePathIgnoringCase, which is only ever called from
+// MountPoints::ResolvePath while holding m_mutex - relies on that lock, takes none of its own.
+std::unordered_map<std::string, DirectoryListingCache>& GetDirListingCache() {
+	static std::unordered_map<std::string, DirectoryListingCache> cache;
+	return cache;
+}
+} // namespace
+
 // Resolve guest paths case-insensitively on case-sensitive hosts.
 static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
 	std::error_code ec;
@@ -304,17 +325,26 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 			continue;
 		}
 
-		bool found = false;
-		for (std::filesystem::directory_iterator entry(resolved, ec), end; entry != end;
-		     entry.increment(ec)) {
-			if (ec) {
-				break;
+		const auto dir_mtime = std::filesystem::last_write_time(resolved, ec);
+		auto&      dir_cache = GetDirListingCache()[resolved.string()];
+		if (ec || dir_cache.mtime != dir_mtime) {
+			dir_cache.mtime = dir_mtime;
+			dir_cache.by_lower_name.clear();
+			std::error_code list_ec;
+			for (std::filesystem::directory_iterator entry(resolved, list_ec), end;
+			     entry != end; entry.increment(list_ec)) {
+				if (list_ec) {
+					break;
+				}
+				dir_cache.by_lower_name.emplace(
+				    Common::ToLower(entry->path().filename().string()), entry->path());
 			}
-			if (Common::EqualNoCase(entry->path().filename().string(), component.string())) {
-				resolved = entry->path();
-				found    = true;
-				break;
-			}
+		}
+
+		const auto it    = dir_cache.by_lower_name.find(Common::ToLower(component.string()));
+		const bool found = it != dir_cache.by_lower_name.end();
+		if (found) {
+			resolved = it->second;
 		}
 
 		if (!found) {
