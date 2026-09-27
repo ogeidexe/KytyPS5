@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,13 @@ struct Stream {
 	Uint64             next_check    = 0;
 	Uint64             last_sound    = 0;
 	bool               playing       = false;
+	// Rumble fallback when there is no controller audio device (Bluetooth).
+	float              env_left      = 0.0f;
+	float              env_right     = 0.0f;
+	Uint64             rumble_time   = 0;
+	Uint64             sent_time     = 0;
+	uint8_t            sent_left     = 0;
+	uint8_t            sent_right    = 0;
 	std::vector<float> converted;
 	std::vector<float> silence;
 };
@@ -158,8 +166,8 @@ static SDL_AudioDeviceID FindDevice(const Stream* stream) {
 			     "4-channel (quadraphonic) speaker setup, then reconnect the controller\n",
 			     too_few_channels.c_str(), too_few_channels_num, DEVICE_CHANNELS);
 		} else {
-			LOGF("PadHaptics: no DualSense audio device; haptics need the controller connected by "
-			     "USB\n");
+			LOGF("PadHaptics: no DualSense audio device (Bluetooth or no controller); playing haptics "
+			     "as rumble. Connect by USB for full HD haptics\n");
 		}
 	}
 	return found;
@@ -266,9 +274,80 @@ void Close(Stream* stream) {
 	}
 
 	SetPlaying(stream, false);
+	if (stream->sent_left != 0 || stream->sent_right != 0) {
+		Controller::SetHapticsRumble(0, 0); // stop any rumble the Bluetooth fallback left on
+	}
 	CloseDevice(stream);
 	delete stream;
 	SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+// Over Bluetooth Windows exposes no DualSense audio device, so the actuator channels cannot be
+// played as audio. Follow each actuator's amplitude instead (instant attack, short release) and
+// drive the controller's rumble with it; SDL maps DualSense rumble onto the same actuators through
+// the controller's rumble emulation, so the title's haptics are still felt.
+constexpr float  HAPTIC_RELEASE_MS = 40.0f;
+
+// KYTY_HAPTIC_RUMBLE_GAIN scales the fallback's strength (default 1.0; 0 disables it).
+static float HapticRumbleGain() {
+	static const float gain = [] {
+		const char* value = std::getenv("KYTY_HAPTIC_RUMBLE_GAIN");
+		const float g     = value != nullptr ? std::strtof(value, nullptr) : 1.0f;
+		return std::clamp(g, 0.0f, 4.0f);
+	}();
+	return gain;
+}
+constexpr Uint64 HAPTIC_REFRESH_MS = 50; // under the controller's rumble timeout
+
+static void RumbleFromHaptics(Stream* stream, const void* data, uint32_t frames, uint32_t channels,
+                              bool is_float, const int* volume, Uint64 now) {
+	stream->converted.resize(static_cast<size_t>(frames) * DEVICE_CHANNELS);
+	ToControllerFrames(data, frames, channels, is_float, volume, stream->converted.data());
+	// RMS rather than peak: haptic waveforms have high peaks even for subtle textures, and RMS
+	// tracks how strong the actuator actually feels.
+	const float gain = HapticRumbleGain();
+	if (gain <= 0.0f) {
+		return;
+	}
+	float left  = 0.0f;
+	float right = 0.0f;
+	for (uint32_t frame = 0; frame < frames; frame++) {
+		const float* src = stream->converted.data() + static_cast<size_t>(frame) * DEVICE_CHANNELS;
+		left += src[LEFT_ACTUATOR] * src[LEFT_ACTUATOR];
+		right += src[RIGHT_ACTUATOR] * src[RIGHT_ACTUATOR];
+	}
+	left  = std::sqrt(left / static_cast<float>(frames)) * gain;
+	right = std::sqrt(right / static_cast<float>(frames)) * gain;
+	const float elapsed = stream->rumble_time == 0 ? 0.0f : static_cast<float>(now - stream->rumble_time);
+	stream->rumble_time = now;
+	const float decay   = std::exp(-elapsed / HAPTIC_RELEASE_MS);
+	stream->env_left    = std::max(std::min(left, 1.0f), stream->env_left * decay);
+	stream->env_right   = std::max(std::min(right, 1.0f), stream->env_right * decay);
+	const auto level    = [](float envelope) {
+        return static_cast<uint8_t>(envelope < SILENCE_LEVEL ? 0.0f : envelope * 255.0f + 0.5f);
+	};
+	const uint8_t out_left  = level(stream->env_left);
+	const uint8_t out_right = level(stream->env_right);
+	const bool    active    = out_left != 0 || out_right != 0;
+	const bool    changed   = std::abs(out_left - stream->sent_left) >= 3 ||
+	                     std::abs(out_right - stream->sent_right) >= 3 ||
+	                     (!active && (stream->sent_left != 0 || stream->sent_right != 0));
+	if (changed || (active && now - stream->sent_time >= HAPTIC_REFRESH_MS)) {
+		Controller::SetHapticsRumble(out_left, out_right);
+		stream->sent_left  = out_left;
+		stream->sent_right = out_right;
+		stream->sent_time  = now;
+	}
+}
+
+static void StopHapticsRumble(Stream* stream) {
+	if (stream->sent_left != 0 || stream->sent_right != 0) {
+		Controller::SetHapticsRumble(0, 0);
+	}
+	stream->sent_left  = 0;
+	stream->sent_right = 0;
+	stream->env_left   = 0.0f;
+	stream->env_right  = 0.0f;
 }
 
 void Queue(Stream* stream, const void* data, uint32_t frames, uint32_t channels, bool is_float,
@@ -284,8 +363,10 @@ void Queue(Stream* stream, const void* data, uint32_t frames, uint32_t channels,
 	}
 	if (stream->sdl == nullptr) {
 		SetPlaying(stream, false);
+		RumbleFromHaptics(stream, data, frames, channels, is_float, volume, now);
 		return;
 	}
+	StopHapticsRumble(stream);
 
 	stream->converted.resize(static_cast<size_t>(frames) * DEVICE_CHANNELS);
 	const float peak =

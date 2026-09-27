@@ -114,6 +114,7 @@ public:
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetAudioHapticsPlaying(bool playing);
+	void SetHapticsRumble(uint8_t left, uint8_t right);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -142,6 +143,8 @@ private:
 	uint8_t          m_large_motor   = 0;
 	uint8_t          m_small_motor   = 0;
 	bool             m_audio_haptics = false;
+	uint8_t          m_haptic_large  = 0;
+	uint8_t          m_haptic_small  = 0;
 };
 
 static GameController* g_controller = nullptr;
@@ -571,6 +574,16 @@ void GameController::SetAudioHapticsPlaying(bool playing) {
 	}
 }
 
+void GameController::SetHapticsRumble(uint8_t left, uint8_t right) {
+	Common::LockGuard lock(m_mutex);
+
+	if (m_haptic_large != left || m_haptic_small != right || left != 0 || right != 0) {
+		m_haptic_large = left;
+		m_haptic_small = right;
+		ApplyRumble();
+	}
+}
+
 void GameController::ApplyRumble() {
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
 		return;
@@ -582,8 +595,10 @@ void GameController::ApplyRumble() {
 	}
 
 	const bool muted = m_audio_haptics && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5;
-	const auto large = static_cast<uint16_t>(muted ? 0U : m_large_motor * 0x101U);
-	const auto small = static_cast<uint16_t>(muted ? 0U : m_small_motor * 0x101U);
+	const auto large_level = std::max(m_large_motor, m_haptic_large);
+	const auto small_level = std::max(m_small_motor, m_haptic_small);
+	const auto large       = static_cast<uint16_t>(muted ? 0U : large_level * 0x101U);
+	const auto small       = static_cast<uint16_t>(muted ? 0U : small_level * 0x101U);
 	if (!SDL_RumbleGamepad(pad, large, small, RUMBLE_DURATION_MS)) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
@@ -715,6 +730,10 @@ void ResetInputState() {
 
 void SetAudioHapticsPlaying(bool playing) {
 	g_controller->SetAudioHapticsPlaying(playing);
+}
+
+void SetHapticsRumble(uint8_t left, uint8_t right) {
+	g_controller->SetHapticsRumble(left, right);
 }
 
 int KYTY_SYSV_ABI PadInit() {

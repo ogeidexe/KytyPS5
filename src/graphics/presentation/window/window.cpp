@@ -756,6 +756,12 @@ static void WindowCreate(WindowContext& context) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
 #endif
+	// A DualSense or DualShock 4 over Bluetooth sends a reduced report without touchpad or motion
+	// data until the host switches it to enhanced reports. SDL's default ("auto") only does that once
+	// the application sends an effect or enables a sensor, so a title reading the touchpad before
+	// either would see nothing. Enable them up front, as the PS5 itself does. The user can still
+	// override it through the environment (SDL_JOYSTICK_ENHANCED_REPORTS).
+	SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1", SDL_HINT_DEFAULT);
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
