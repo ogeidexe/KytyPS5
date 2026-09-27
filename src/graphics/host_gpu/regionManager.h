@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <immintrin.h>
 #include <mutex>
 #include <utility>
 
@@ -37,7 +38,14 @@ public:
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// Spin on a plain load, not the RMW above: test_and_set forces the cache line
+			// out of every other spinning core on each attempt, so under real contention
+			// (this lock is taken from several worker threads) the retry storm itself was
+			// costing the majority of a run's CPU time. PAUSE also backs off the retry rate
+			// instead of hammering the coherency bus at full clock speed every iteration.
+			while (m_lock.test(std::memory_order_relaxed)) {
+				_mm_pause();
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
