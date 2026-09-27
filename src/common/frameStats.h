@@ -64,6 +64,9 @@ inline void StoreMax(std::atomic<uint32_t>& target, uint32_t value) {
 }
 inline std::atomic<uint32_t> g_image_creates {0};
 inline std::atomic<uint32_t> g_image_deletes {0};
+// Diagnostic: wall time spent detiling and uploading new texture data (TextureCache::UploadImage),
+// to tell a burst of new-texture stalls apart from shader compiles when both spike together.
+inline std::atomic<uint64_t> g_image_upload_us {0};
 
 // Adds the lifetime of the scope to the compile counters.
 class CompileScope {
@@ -78,6 +81,24 @@ public:
 
 	CompileScope(const CompileScope&)            = delete;
 	CompileScope& operator=(const CompileScope&) = delete;
+
+private:
+	uint64_t m_start;
+};
+
+// Adds the lifetime of the scope to g_image_upload_us. Separate from CompileScope so a burst of
+// new-texture stalls doesn't get attributed to shader compilation.
+class UploadScope {
+public:
+	UploadScope(): m_start(Timer::QueryPerformanceCounter()) {}
+	~UploadScope() {
+		const auto elapsed = Timer::QueryPerformanceCounter() - m_start;
+		g_image_upload_us.fetch_add(elapsed * 1000000 / Timer::QueryPerformanceFrequency(),
+		                            std::memory_order_relaxed);
+	}
+
+	UploadScope(const UploadScope&)            = delete;
+	UploadScope& operator=(const UploadScope&) = delete;
 
 private:
 	uint64_t m_start;

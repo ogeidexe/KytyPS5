@@ -973,12 +973,13 @@ void WindowContext::UpdateTitle() {
 			// std::printf, not LOGF: the report was asked for explicitly, so it must not be
 			// muted by the printf direction.
 			std::printf("[frame-stats] frame=%" PRIu64 " frames=%u worst=%.1fms over33=%u"
-			            " over100=%u compiles=%u compile=%.1fms images+%u/-%u audioq=%ums"
-			            " underruns=%u\n",
+			            " over100=%u compiles=%u compile=%.1fms images+%u/-%u upload=%.1fms"
+			            " audioq=%ums underruns=%u\n",
 			            frame_num, stats_frames, worst_ms, over_33ms, over_100ms, compiles,
 			            static_cast<double>(compile_us) / 1000.0,
 			            Common::FrameStats::g_image_creates.exchange(0),
 			            Common::FrameStats::g_image_deletes.exchange(0),
+			            Common::FrameStats::g_image_upload_us.exchange(0) / 1000.0,
 			            Common::FrameStats::g_audio_queue_max_ms.exchange(0),
 			            Common::FrameStats::g_audio_underruns.exchange(0));
 			const auto flips = Common::FrameStats::g_flip_count.exchange(0);
