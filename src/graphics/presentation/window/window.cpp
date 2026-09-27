@@ -974,14 +974,16 @@ void WindowContext::UpdateTitle() {
 			// muted by the printf direction.
 			std::printf("[frame-stats] frame=%" PRIu64 " frames=%u worst=%.1fms over33=%u"
 			            " over100=%u compiles=%u compile=%.1fms images+%u/-%u upload=%.1fms"
-			            " audioq=%ums underruns=%u\n",
+			            " audioq=%ums underruns=%u faults=%u fault=%.1fms\n",
 			            frame_num, stats_frames, worst_ms, over_33ms, over_100ms, compiles,
 			            static_cast<double>(compile_us) / 1000.0,
 			            Common::FrameStats::g_image_creates.exchange(0),
 			            Common::FrameStats::g_image_deletes.exchange(0),
 			            Common::FrameStats::g_image_upload_us.exchange(0) / 1000.0,
 			            Common::FrameStats::g_audio_queue_max_ms.exchange(0),
-			            Common::FrameStats::g_audio_underruns.exchange(0));
+			            Common::FrameStats::g_audio_underruns.exchange(0),
+			            Common::FrameStats::g_fault_count.exchange(0),
+			            Common::FrameStats::g_fault_us.exchange(0) / 1000.0);
 			const auto flips = Common::FrameStats::g_flip_count.exchange(0);
 			const auto flip_sum_us = Common::FrameStats::g_flip_latency_sum_us.exchange(0);
 			std::printf("[frame-stats]   submit_wait_max=%.1fms flip_latency avg=%.1fms max=%.1fms"

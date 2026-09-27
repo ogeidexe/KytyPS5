@@ -67,6 +67,10 @@ inline std::atomic<uint32_t> g_image_deletes {0};
 // Diagnostic: wall time spent detiling and uploading new texture data (TextureCache::UploadImage),
 // to tell a burst of new-texture stalls apart from shader compiles when both spike together.
 inline std::atomic<uint64_t> g_image_upload_us {0};
+// Diagnostic: guest-CPU write-protection faults (RenderContext::HandleFault), to tell a burst of
+// them apart from shader compiles and texture uploads when several spike on the same frame.
+inline std::atomic<uint32_t> g_fault_count {0};
+inline std::atomic<uint64_t> g_fault_us {0};
 
 // Adds the lifetime of the scope to the compile counters.
 class CompileScope {
@@ -99,6 +103,24 @@ public:
 
 	UploadScope(const UploadScope&)            = delete;
 	UploadScope& operator=(const UploadScope&) = delete;
+
+private:
+	uint64_t m_start;
+};
+
+// Adds the lifetime of the scope to g_fault_us and counts it in g_fault_count.
+class FaultScope {
+public:
+	FaultScope(): m_start(Timer::QueryPerformanceCounter()) {}
+	~FaultScope() {
+		const auto elapsed = Timer::QueryPerformanceCounter() - m_start;
+		g_fault_us.fetch_add(elapsed * 1000000 / Timer::QueryPerformanceFrequency(),
+		                     std::memory_order_relaxed);
+		g_fault_count.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	FaultScope(const FaultScope&)            = delete;
+	FaultScope& operator=(const FaultScope&) = delete;
 
 private:
 	uint64_t m_start;
