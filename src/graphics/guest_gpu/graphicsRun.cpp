@@ -63,7 +63,11 @@ struct DrawIndexedIndirectArgs {
 // after a synchronous readback that drains the queue. KYTY_SPECULATIVE_INDIRECT=N reuses the last
 // real read for up to N-1 draws from the same address before reading again. The values are ones
 // the title really produced, so a stale value costs at most N-1 frames of a wrong draw count
-// (an object popping in or out late), not invalid state. Unset (the default) always reads.
+// (an object popping in or out late), not invalid state. Default 16, chosen from A/B testing on
+// Astro Bot across both Windows and Linux (ab_final_spec16 / ab_linux_spec16 vs. unspeculated
+// runs): consistently the best 1% low and readback-stall numbers with no visible popping. Set
+// KYTY_SPECULATIVE_INDIRECT=0 (or 1) to fall back to always reading, or to another value in
+// [2, 60] to override.
 struct IndirectArgsSpeculation {
 	std::array<uint32_t, 5> words {};
 	uint32_t                uses = 0;
@@ -72,7 +76,10 @@ struct IndirectArgsSpeculation {
 static uint32_t SpeculativeIndirectInterval() {
 	static const uint32_t interval = [] {
 		const char* value = std::getenv("KYTY_SPECULATIVE_INDIRECT");
-		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+		if (value == nullptr) {
+			return 16u;
+		}
+		const auto n = std::strtoul(value, nullptr, 10);
 		return n >= 2 && n <= 60 ? static_cast<uint32_t>(n) : 0u;
 	}();
 	return interval;
