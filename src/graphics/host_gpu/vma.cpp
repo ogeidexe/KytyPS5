@@ -21,8 +21,125 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <mutex>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Images the texture cache destroys are frequently recreated with the same parameters a few
+// frames later (hundreds per second in some titles), and each one costs a dedicated device
+// allocation and free in the kernel driver. A destroyed image is only returned here once the GPU
+// is done with it (Image destruction is deferred until its tick completes), so an idle image with
+// identical create parameters can be handed back instead. Its contents are undefined and its
+// tracked layout is reset to UNDEFINED, exactly as for a freshly created image.
+// KYTY_IMAGE_POOL=0 disables reuse.
+struct ImagePoolKey {
+	vk::ImageCreateFlags  flags;
+	vk::ImageType         type = vk::ImageType::e2D;
+	vk::Extent3D          extent;
+	uint32_t              mips = 0, layers = 0;
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageUsageFlags   usage;
+	vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
+
+	bool operator==(const ImagePoolKey&) const = default;
+};
+
+struct PooledImage {
+	ImagePoolKey  key;
+	vk::Image     image      = nullptr;
+	VmaAllocation allocation = nullptr;
+	uint64_t      bytes      = 0;
+};
+
+class ImagePool {
+public:
+	static constexpr uint64_t MaxBytes  = 256ull * 1024 * 1024;
+	static constexpr size_t   MaxPerKey = 8;
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_IMAGE_POOL");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		return enabled;
+	}
+
+	bool Take(const ImagePoolKey& key, vk::Image& image, VmaAllocation& allocation) {
+		std::lock_guard lock(m_mutex);
+		for (auto it = m_entries.rbegin(); it != m_entries.rend(); ++it) {
+			if (it->key == key) {
+				image      = it->image;
+				allocation = it->allocation;
+				m_bytes -= it->bytes;
+				m_entries.erase(std::next(it).base());
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Returns false when the image should be destroyed instead.
+	bool Put(VmaAllocator allocator, const ImagePoolKey& key, vk::Image image,
+	         VmaAllocation allocation) {
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, allocation, &info);
+		const auto bytes = static_cast<uint64_t>(info.size);
+		if (bytes > MaxBytes / 4) {
+			return false;
+		}
+		std::vector<PooledImage> evicted;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto same = std::count_if(m_entries.begin(), m_entries.end(),
+			                                [&](const PooledImage& e) { return e.key == key; });
+			if (static_cast<size_t>(same) >= MaxPerKey) {
+				return false;
+			}
+			m_entries.push_back({key, image, allocation, bytes});
+			m_bytes += bytes;
+			while (m_bytes > MaxBytes && !m_entries.empty()) {
+				evicted.push_back(m_entries.front());
+				m_bytes -= m_entries.front().bytes;
+				m_entries.pop_front();
+			}
+		}
+		for (const auto& e: evicted) {
+			vmaDestroyImage(allocator, e.image, e.allocation);
+		}
+		return true;
+	}
+
+	void Flush(VmaAllocator allocator) {
+		std::lock_guard lock(m_mutex);
+		for (const auto& e: m_entries) {
+			vmaDestroyImage(allocator, e.image, e.allocation);
+		}
+		m_entries.clear();
+		m_bytes = 0;
+	}
+
+private:
+	std::mutex              m_mutex;
+	std::deque<PooledImage> m_entries;
+	uint64_t                m_bytes = 0;
+};
+
+ImagePool& GetImagePool() {
+	static ImagePool pool;
+	return pool;
+}
+
+ImagePoolKey MakeImagePoolKey(const vk::ImageCreateInfo& info) {
+	return {info.flags,       info.imageType, info.extent, info.mipLevels,
+	        info.arrayLayers, info.format,    info.usage,  info.samples};
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -56,6 +173,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	GetImagePool().Flush(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -132,17 +250,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	const bool pooled = ImagePool::Enabled() && image_info.pNext == nullptr &&
+	                    image_info.initialLayout == vk::ImageLayout::eUndefined &&
+	                    GetImagePool().Take(MakeImagePoolKey(image_info), image.image,
+	                                        image.allocation);
+	if (!pooled) {
+		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto        result       = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+		image.image = native_image;
+		if (result != vk::Result::eSuccess) {
+			LogMemoryBudget();
+			return false;
+		}
 	}
 
 	image.format     = image_info.format;
@@ -163,7 +287,19 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	vk::ImageCreateInfo info {};
+	info.flags       = image.flags;
+	info.imageType   = image.image_type;
+	info.extent      = image.extent;
+	info.mipLevels   = image.mip_levels;
+	info.arrayLayers = image.layers;
+	info.format      = image.format;
+	info.usage       = image.usage;
+	info.samples     = static_cast<vk::SampleCountFlagBits>(image.samples);
+	if (!ImagePool::Enabled() ||
+	    !GetImagePool().Put(allocator, MakeImagePoolKey(info), image.image, image.allocation)) {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }
