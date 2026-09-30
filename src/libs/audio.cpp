@@ -376,20 +376,20 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
-		// A deeper queue rides out emulator stalls (pipeline compiles, GPU readbacks) that would
-		// otherwise drain it and crackle. KYTY_AUDIO_LATENCY_MS overrides the 100 ms default.
+		// Every queued millisecond is a millisecond of sound lagging the picture. Since output
+		// stopped underrunning, the default 40 ms queue no longer drains on emulator stalls;
+		// KYTY_AUDIO_LATENCY_MS deepens it for machines that still crackle.
 		static const uint64_t target_latency_us = [] {
 			const char* value = std::getenv("KYTY_AUDIO_LATENCY_MS");
 			const auto  ms    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
-			return (ms >= 10 && ms <= 1000 ? ms : 100) * 1000ull;
+			return ms >= 10 && ms <= 1000 ? ms * 1000ull : AUDIO_OUT_TARGET_LATENCY_US;
 		}();
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
 		// Up to 96 buffers so KYTY_AUDIO_LATENCY_MS can actually reach its 1000 ms limit (the old
-		// cap of 16 silently stopped at ~171 ms for 512-sample ports). A larger delay lines sound
-		// up with a picture that runs late when the emulated frame rate is low.
+		// cap of 16 silently stopped at ~171 ms for 512-sample ports).
 		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 96u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto queued                = SDL_GetAudioStreamQueued(port->stream);
