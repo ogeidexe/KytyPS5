@@ -1425,6 +1425,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                       : 0;
 			add('s', j, guest, info.buffer, info.offset, info.range);
 		}
+		// Pixel stage storage buffers ('p'), for replaying the draw outside the emulator.
+		if (stages.size() > 1) {
+			const auto* pixel = stages.back();
+			for (const auto& info: pixel->buffers) {
+				const auto j     = static_cast<uint32_t>(&info - pixel->buffers.data());
+				const auto guest = j < pixel->buffer_sources.size() ? pixel->buffer_sources[j].address
+				                                                    : 0;
+				add('p', j, guest, info.buffer, info.offset, info.range);
+			}
+		}
 		if (draw.IsIndexed()) {
 			const uint64_t element = index_binding.type == vk::IndexType::eUint32 ? 4u : 2u;
 			add('i', 0, index_source.address, index_binding.buffer, index_binding.offset,
