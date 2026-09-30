@@ -285,17 +285,24 @@ void TestRangeSet() {
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
-  constexpr GuestRange last_byte{TRACKER_ADDRESS_SIZE - 1, 1};
+  constexpr uint64_t extended_end = Libs::LibKernel::Memory::kExtendedMemoryBase +
+                                    Libs::LibKernel::Memory::kExtendedMemorySize;
+  constexpr GuestRange last_byte{extended_end - 1, 1};
 
   static_assert(empty.Empty() && !empty.Valid() && empty.ValidOrEmpty());
   static_assert(!first_byte.Empty() && first_byte.Valid() &&
                 first_byte.ValidOrEmpty() && first_byte.End() == 2);
-  static_assert(last_byte.Valid() && last_byte.End() == TRACKER_ADDRESS_SIZE);
+  static_assert(last_byte.Valid() && last_byte.End() == extended_end);
 
   Check(!GuestRange{0, 1}.Empty() && !GuestRange{0, 1}.ValidOrEmpty(),
         "zero-address nonempty guest range is rejected");
   Check(!GuestRange{1, 0}.Empty() && !GuestRange{1, 0}.ValidOrEmpty(),
         "nonzero-address empty guest range is rejected");
+  Check(GuestRange{Libs::LibKernel::Memory::kExtendedMemoryBase, 1}.Valid() &&
+            !GuestRange{Libs::Graphics::LOWER_ADDRESS_SIZE, 1}.Valid() &&
+            !GuestRange{Libs::LibKernel::Memory::kExtendedMemoryBase - 1, 2}.Valid() &&
+            !GuestRange{extended_end - 1, 2}.Valid(),
+        "extended range and gap boundaries are enforced");
   Check(!GuestRange{TRACKER_ADDRESS_SIZE, 1}.Valid(),
         "first address beyond the guest range is rejected");
   Check(!GuestRange{TRACKER_ADDRESS_SIZE - 1, 2}.Valid(),
@@ -892,15 +899,20 @@ void CheckDeathCase(const char *name) {
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
 #else
+#if defined(__APPLE__)
+  std::vector<char> path(PATH_MAX);
+  uint32_t path_size = static_cast<uint32_t>(path.size());
+  if (_NSGetExecutablePath(path.data(), &path_size) != 0) {
+    path.resize(path_size);
+    Check(_NSGetExecutablePath(path.data(), &path_size) == 0,
+          "_NSGetExecutablePath failed");
+  }
+#endif
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
 #if defined(__APPLE__)
-    char path[PATH_MAX]{};
-    uint32_t path_size = sizeof(path);
-    Check(_NSGetExecutablePath(path, &path_size) == 0,
-          "_NSGetExecutablePath failed");
-    ::execl(path, "MemoryTrackerTests", "--death", name, nullptr);
+    ::execl(path.data(), "MemoryTrackerTests", "--death", name, nullptr);
 #else
     ::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
 #endif

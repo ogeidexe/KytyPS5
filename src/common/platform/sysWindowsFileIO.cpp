@@ -412,25 +412,27 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return 0;
 }
 
-/**
- * @brief Retrieves the size of a file by path in bytes.
- *
- * @param file_name Path to the file.
- * @return File size in bytes, or 0 if retrieval fails.
- */
-uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	LARGE_INTEGER             s;
-	WIN32_FILE_ATTRIBUTE_DATA a;
-
-	auto wide = ToExtendedPath(file_name);
-	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
-		return 0;
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	const bool directory_path = !name.empty() && !name.has_filename() && name != name.root_path();
+	WIN32_FILE_ATTRIBUTE_DATA info {};
+	const auto                wide = ToExtendedPath(directory_path ? name.parent_path() : name);
+	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &info) == 0) {
+		return false;
 	}
+	const bool file = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+	if (directory_path && file) {
+		return false;
+	}
+	*is_file = file;
+	*size = *is_file ? ((static_cast<uint64_t>(info.nFileSizeHigh) << 32u) | info.nFileSizeLow) : 0;
+	return true;
+}
 
-	s.HighPart = static_cast<LONG>(a.nFileSizeHigh);
-	s.LowPart  = a.nFileSizeLow;
-
-	return s.QuadPart;
+uint64_t SysFileSize(const std::filesystem::path& file_name) {
+	bool is_file;
+	uint64_t size = 0;
+	SysFileGetInfo(file_name, &is_file, &size);
+	return size;
 }
 
 bool SysFileTruncate(sys_file_t& f, uint64_t size) {
@@ -504,10 +506,9 @@ bool SysFileIsError(sys_file_t& f) {
  * @return true if the directory exists, false otherwise.
  */
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto  wide = ToExtendedPath(path);
-	DWORD a    = GetFileAttributesW(wide.c_str());
-	return a != INVALID_FILE_ATTRIBUTES &&
-	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(path, &is_file, &size) && !is_file;
 }
 
 /**
@@ -517,10 +518,9 @@ bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
  * @return true if the file exists, false otherwise.
  */
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto  wide = ToExtendedPath(name);
-	DWORD a    = GetFileAttributesW(wide.c_str());
-	return a != INVALID_FILE_ATTRIBUTES &&
-	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
 
 /**

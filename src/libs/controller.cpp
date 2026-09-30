@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
@@ -113,8 +114,7 @@ public:
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
-	void SetAudioHapticsPlaying(bool playing);
-	void SetHapticsRumble(uint8_t left, uint8_t right);
+	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -125,7 +125,6 @@ private:
 
 	void CheckActive();
 	void AddState();
-	void ApplyRumble(); // Caller holds m_mutex.
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -140,11 +139,6 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
-	uint8_t          m_large_motor   = 0;
-	uint8_t          m_small_motor   = 0;
-	bool             m_audio_haptics = false;
-	uint8_t          m_haptic_large  = 0;
-	uint8_t          m_haptic_small  = 0;
 };
 
 static GameController* g_controller = nullptr;
@@ -303,6 +297,9 @@ void GameController::Connect(int id) {
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
+			if (const auto& color = Config::GetControllerColor()) {
+				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
 				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
@@ -526,6 +523,7 @@ void GameController::ResetInputState() {
 
 void GameController::ReleaseHostPads() {
 	Common::LockGuard lock(m_mutex);
+	DualSenseHaptics::Shutdown();
 
 	std::vector<SDL_Gamepad*> pads;
 	for (const auto id: m_connected_ids) {
@@ -559,32 +557,10 @@ void GameController::ReleaseHostPads() {
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
-
-	m_large_motor = large_motor;
-	m_small_motor = small_motor;
-	ApplyRumble();
-}
-
-void GameController::SetAudioHapticsPlaying(bool playing) {
-	Common::LockGuard lock(m_mutex);
-
-	if (m_audio_haptics != playing) {
-		m_audio_haptics = playing;
-		ApplyRumble();
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor)) {
+		return;
 	}
-}
 
-void GameController::SetHapticsRumble(uint8_t left, uint8_t right) {
-	Common::LockGuard lock(m_mutex);
-
-	if (m_haptic_large != left || m_haptic_small != right || left != 0 || right != 0) {
-		m_haptic_large = left;
-		m_haptic_small = right;
-		ApplyRumble();
-	}
-}
-
-void GameController::ApplyRumble() {
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
 		return;
 	}
@@ -594,18 +570,25 @@ void GameController::ApplyRumble() {
 		return;
 	}
 
-	const bool muted = m_audio_haptics && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5;
-	const auto large_level = std::max(m_large_motor, m_haptic_large);
-	const auto small_level = std::max(m_small_motor, m_haptic_small);
-	const auto large       = static_cast<uint16_t>(muted ? 0U : large_level * 0x101U);
-	const auto small       = static_cast<uint16_t>(muted ? 0U : small_level * 0x101U);
+	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
+	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
 	if (!SDL_RumbleGamepad(pad, large, small, RUMBLE_DURATION_MS)) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
 }
 
+int GameController::GetActiveControllerId() {
+	Common::LockGuard lock(m_mutex);
+	return m_active_id;
+}
+
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
+	if (const auto& color = Config::GetControllerColor()) {
+		r = (*color)[0];
+		g = (*color)[1];
+		b = (*color)[2];
+	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
 		(void)SDL_SetGamepadLED(pad, r, g, b);
@@ -728,12 +711,8 @@ void ResetInputState() {
 	g_controller->ResetInputState();
 }
 
-void SetAudioHapticsPlaying(bool playing) {
-	g_controller->SetAudioHapticsPlaying(playing);
-}
-
-void SetHapticsRumble(uint8_t left, uint8_t right) {
-	g_controller->SetHapticsRumble(left, right);
+int GetActiveControllerId() {
+	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
 }
 
 int KYTY_SYSV_ABI PadInit() {

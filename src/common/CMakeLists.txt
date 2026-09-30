@@ -23,6 +23,7 @@ target_link_libraries(common
 	PRIVATE
 		kyty_git_version
 		spdlog::spdlog
+		ZArchive::zarchive
 )
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

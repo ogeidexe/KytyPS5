@@ -1,8 +1,6 @@
 #include "common/common.h"
-#include "common/exfatImage.h"
 #include "common/file.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
@@ -13,12 +11,14 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
@@ -582,90 +582,94 @@ public:
 	FileStreamer() = default;
 	~FileStreamer() {
 		if (ctx != nullptr) {
+			av_freep(&ctx->buffer);
 			avio_context_free(&ctx);
 		}
-		if (opened && !host_file && file.close != nullptr) {
+		if (opened) {
 			file.close(file.object_pointer);
 		}
 	}
 	bool Init(const std::string& path) {
-		if (file.open == nullptr || file.close == nullptr || file.read_offset == nullptr ||
-		    file.size == nullptr) {
+		if (file.open != nullptr) {
+			if (file.close == nullptr || file.read_offset == nullptr || file.size == nullptr ||
+			    file.open(file.object_pointer, path.c_str()) < 0) {
+				return false;
+			}
+			opened = true;
+			size   = file.size(file.object_pointer);
+		} else {
+			if (!local_file.Open(LibKernel::FileSystem::GetRealFilename(path),
+			                     Common::File::Mode::Read)) {
+				return false;
+			}
+			size = local_file.Size();
+		}
+		if (size == 0 || size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
 			return false;
 		}
-		if (file.open(file.object_pointer, path.c_str()) < 0) {
+		constexpr int buffer_size = 64 * 1024;
+		auto*         buf         = static_cast<uint8_t*>(av_malloc(buffer_size));
+		if (buf == nullptr) {
 			return false;
 		}
-		opened = true;
-		size   = file.size(file.object_pointer);
-		return InitContext();
-	}
-	bool InitHost(const std::filesystem::path& path) {
-		if (!host_stream.Open(path, Common::File::Mode::Read)) {
-			return false;
+		ctx = avio_alloc_context(buf, buffer_size, 0, this, Read, nullptr, Seek);
+		if (ctx == nullptr) {
+			av_free(buf);
 		}
-		host_file = true;
-		size = host_stream.Size();
-		return InitContext();
+		return ctx != nullptr;
 	}
 	AVIOContext* Context() const { return ctx; }
 
 private:
-	bool InitContext() {
-		if (size == 0) {
-			return false;
-		}
-		auto* buf = static_cast<uint8_t*>(av_malloc(4096));
-		if (buf == nullptr) {
-			return false;
-		}
-		ctx = avio_alloc_context(buf, 4096, 0, this, Read, nullptr, Seek);
-		return ctx != nullptr;
-	}
 	static int Read(void* opaque, uint8_t* buf, int len) {
 		auto* s = static_cast<FileStreamer*>(opaque);
 		if (s->pos >= s->size) {
 			return AVERROR_EOF;
 		}
-		len = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
-		int r = 0;
-		if (s->host_file) {
-			uint32_t count = 0;
-			if (!s->host_stream.Seek(s->pos)) {
-				return AVERROR(EIO);
-			}
-			s->host_stream.Read(buf, static_cast<uint32_t>(len), &count);
-			r = static_cast<int>(count);
+		len      = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
+		int read = 0;
+		if (s->opened) {
+			read = s->file.read_offset(s->file.object_pointer, buf, s->pos,
+			                           static_cast<uint32_t>(len));
 		} else {
-			r = s->file.read_offset(s->file.object_pointer, buf, s->pos,
-			                         static_cast<uint32_t>(len));
+			uint32_t bytes = 0;
+			s->local_file.Read(buf, static_cast<uint32_t>(len), &bytes);
+			read = static_cast<int>(bytes);
 		}
-		if (r <= 0) {
-			return r == 0 ? AVERROR_EOF : r;
+		if (read <= 0 || read > len) {
+			return read < 0 ? read : AVERROR(EIO);
 		}
-		s->pos += static_cast<uint64_t>(r);
-		return r;
+		s->pos += static_cast<uint64_t>(read);
+		return read;
 	}
-	static int64_t Seek(void* opaque, int64_t off, int whence) {
+	static int64_t Seek(void* opaque, int64_t offset, int whence) {
 		auto* s = static_cast<FileStreamer*>(opaque);
 		if ((whence & AVSEEK_SIZE) != 0) {
 			return static_cast<int64_t>(s->size);
 		}
-		int64_t p = whence == SEEK_SET
-		                ? off
-		                : (whence == SEEK_CUR
-		                       ? static_cast<int64_t>(s->pos) + off
-		                       : (whence == SEEK_END ? static_cast<int64_t>(s->size) + off : -1));
-		if (p < 0) {
-			return -1;
+		whence &= ~AVSEEK_FORCE;
+		uint64_t base = 0;
+		switch (whence) {
+			case SEEK_SET: break;
+			case SEEK_CUR: base = s->pos; break;
+			case SEEK_END: base = s->size; break;
+			default: return AVERROR(EINVAL);
 		}
-		p      = std::min<int64_t>(p, static_cast<int64_t>(s->size));
-		s->pos = static_cast<uint64_t>(p);
-		return p;
+		const auto distance = offset < 0 ? uint64_t {0} - static_cast<uint64_t>(offset)
+		                                 : static_cast<uint64_t>(offset);
+		if ((offset < 0 && distance > base) ||
+		    (offset >= 0 && distance > std::numeric_limits<int64_t>::max() - base)) {
+			return AVERROR(EINVAL);
+		}
+		const auto position = offset < 0 ? base - distance : base + distance;
+		if (!s->opened && !s->local_file.Seek(position)) {
+			return AVERROR(EIO);
+		}
+		s->pos = position;
+		return static_cast<int64_t>(position);
 	}
 	AvPlayerFileReplacement file;
-	Common::File            host_stream;
-	bool                    host_file = false;
+	Common::File            local_file;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
 	uint64_t                size   = 0;
@@ -703,40 +707,17 @@ public:
 			return static_cast<Source*>(opaque)->interrupt_io.load() ? 1 : 0;
 		};
 		raw->interrupt_callback.opaque = this;
-		if (file.open != nullptr) {
-			streamer = std::make_unique<FileStreamer>(file);
-			if (!streamer->Init(path)) {
-				avformat_free_context(raw);
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
-			raw->pb = streamer->Context();
-			if (auto rc = avformat_open_input(&raw, nullptr, nullptr, nullptr); rc < 0) {
-				LOGF("\t avformat_open_input callback failed: %s\n", fferr(rc).c_str());
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
-		} else {
-			auto real     = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
-			std::shared_ptr<Common::ExfatImage> image;
-			std::string relative;
-			if (Common::ResolveExfatPath(real, &image, &relative)) {
-				streamer = std::make_unique<FileStreamer>();
-				if (!streamer->InitHost(real)) {
-					avformat_free_context(raw);
-					return AVPLAYER_ERROR_OPERATION_FAILED;
-				}
-				raw->pb = streamer->Context();
-				if (auto rc = avformat_open_input(&raw, nullptr, nullptr, nullptr); rc < 0) {
-					LOGF("\t avformat_open_input image failed: %s\n", fferr(rc).c_str());
-					return AVPLAYER_ERROR_OPERATION_FAILED;
-				}
-			} else {
-			auto real_str = Common::PathToString(real);
-			if (auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr); rc < 0) {
-				LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(),
-				     real_str.c_str());
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
-			}
+		streamer                       = std::make_unique<FileStreamer>(file);
+		if (!streamer->Init(path)) {
+			avformat_free_context(raw);
+			return AVPLAYER_ERROR_OPERATION_FAILED;
+		}
+		raw->pb = streamer->Context();
+		if (const auto rc = avformat_open_input(&raw, file.open == nullptr ? path.c_str() : nullptr,
+		                                        nullptr, nullptr);
+		    rc < 0) {
+			LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(), path.c_str());
+			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		fmt = raw;
 		if (auto rc = avformat_find_stream_info(fmt, nullptr); rc < 0) {
@@ -993,13 +974,8 @@ public:
 			if (deliver_seek_frame) {
 				return true;
 			}
-			// Without A/V sync the frames still keep to the player clock; handing one out on
-			// every call made playback speed depend on how often the title asks.
-			if (audio_id && sync_mode == 0) {
-				return candidate.info.time_stamp <= last_audio_ts;
-			}
-			const auto now = CurrentTimeNoLock();
-			return now == 0 || candidate.info.time_stamp <= now;
+			auto now = CurrentTimeNoLock();
+			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
 		});
 		if (!frame) {
 			return false;
@@ -1044,7 +1020,9 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
-		last_audio_ts = out->time_stamp;
+		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
+		clock_start   = std::chrono::steady_clock::now();
+		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
 		return true;
 	}
@@ -1109,7 +1087,6 @@ private:
 		video_done               = true;
 		audio_done               = true;
 		seek_video_frame_pending = false;
-		last_audio_ts            = 0;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
 	}
@@ -1423,10 +1400,9 @@ private:
 		}
 		return ReceiveFrames(codec, timestamp_offset, buffers, frames, prepare, kind);
 	}
-	// The time video frames are due against: the audio handed to the game when video is synced to
-	// audio, otherwise the player clock.
+	// The time video frames are due against: the player clock, as when frames are handed out.
 	uint64_t VideoReferenceTimeNoLock() const {
-		return audio_id && sync_mode == 0 ? last_audio_ts : CurrentTimeNoLock();
+		return CurrentTimeNoLock();
 	}
 	// Only a couple of output buffers exist and each is freed only when the game fetches the next
 	// frame, so decoding runs at the game's fetch rate. A title that renders slower than the
@@ -1484,7 +1460,6 @@ private:
 				av_frame_free(&frame);
 				return false;
 			}
-			ready.info.time_stamp += timestamp_offset;
 			ready.timestamp_offset = timestamp_offset;
 			frames.Push(std::move(ready));
 			av_frame_free(&frame);
@@ -1628,11 +1603,14 @@ private:
 			return false;
 		}
 		auto* dst = buffer->Get();
-		std::memset(dst, 0, static_cast<size_t>(size));
+		auto* c   = dst + pitch * h;
+		// PPSA02433 samples the padded columns; zero chroma would turn them green.
+		std::memset(dst, s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
+		            static_cast<size_t>(pitch) * h);
+		std::memset(c, 128, static_cast<size_t>(pitch) * h / 2);
 		for (int y = 0; y < src->height; y++) {
 			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);
 		}
-		auto* c = dst + pitch * h;
 		for (int y = 0; y < src->height / 2; y++) {
 			std::memcpy(c + y * pitch, nv12->data[1] + y * nv12->linesize[1], src->width);
 		}
@@ -1761,7 +1739,6 @@ private:
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
-	uint64_t                                 last_audio_ts = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};
