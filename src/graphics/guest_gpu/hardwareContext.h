@@ -191,6 +191,7 @@ struct DepthRenderTarget {
 };
 
 struct RenderControl {
+	uint32_t raw                     = 0; // the register as written (diagnostics)
 	bool    depth_clear_enable       = false;
 	bool    stencil_clear_enable     = false;
 	bool    resummarize_enable       = false;
@@ -203,6 +204,7 @@ struct RenderControl {
 };
 
 struct DepthRenderOverride {
+	uint32_t raw             = 0; // the register as written (diagnostics)
 	bool force_z_valid       = false;
 	bool force_z_dirty       = false;
 	bool force_stencil_valid = false;
@@ -348,6 +350,7 @@ struct AaSampleControl {
 };
 
 struct DepthShaderControl {
+	uint32_t raw                         = 0; // the register as written (diagnostics)
 	uint32_t other_bits                  = 0;
 	uint8_t  conservative_z_export_value = 0;
 	uint8_t  shader_z_behavior           = 0;

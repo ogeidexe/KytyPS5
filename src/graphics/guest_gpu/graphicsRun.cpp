@@ -1066,6 +1066,31 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 		std::memcpy(words, dst, std::min<uint32_t>(size, sizeof(words)));
 		Common::GpuWaitDiagnostics::Note(gpu_written ? "indirect-read-gpu" : "indirect-read-cpu",
 		                                 address, words[0], words[1], size);
+		// Report where implausible or all-zero GPU-written arguments came from: the last shader
+		// write over the address and every cached image overlapping it.
+		static uint32_t reported_bad = 0, reported_zero = 0;
+		const bool bad  = words[0] > (1u << 24) || words[1] > (1u << 24);
+		const bool zero = words[0] == 0 || words[1] == 0;
+		if (gpu_written && ((bad && reported_bad++ < 50) || (zero && reported_zero++ < 10))) {
+			auto&       buffers = m_renderer.GetBufferCache();
+			const auto* writer  = buffers.FindWriter(address);
+			std::printf("[indirect] %s args at 0x%" PRIx64 " size=%u words=%08x %08x buffer_gpu=%d"
+			            " image_gpu=%d tick=%" PRIu64 "\n",
+			            bad ? "IMPLAUSIBLE" : "zero", address, size, words[0], words[1],
+			            buffers.IsRegionGpuModified(address, size) ? 1 : 0,
+			            m_renderer.GetTextureCache().IsRegionGpuModified(address, size) ? 1 : 0,
+			            GetScheduler().CurrentTick());
+			if (writer != nullptr) {
+				std::printf("[indirect]   last shader write: %c shader=%" PRIu64 " pixel=%" PRIu64
+				            " submit=%" PRIu64 " marker=%u tick=%" PRIu64 " range_size=0x%" PRIx64 "\n",
+				            writer->op.kind, writer->op.shader, writer->op.pixel, writer->op.submit,
+				            writer->op.marker, writer->tick, writer->size);
+			} else {
+				std::printf("[indirect]   no recorded shader write covers the address\n");
+			}
+			std::printf("%s", m_renderer.GetTextureCache().DescribeImagesAt(address, size).c_str());
+			std::fflush(stdout);
+		}
 	}
 	if (interval != 0) {
 		auto&      entry = speculation[address];

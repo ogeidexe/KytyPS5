@@ -14,6 +14,7 @@
 
 #include <map>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,6 +35,8 @@ public:
 	// KYTY_GPU_HAZARD_VERIFY=1 only: reports an image about to be used by the command buffer being
 	// recorded after the cache deleted it in an earlier tick (destroyed once that tick completes).
 	void VerifyImageAlive(ImageId id, const char* use, uint64_t submit_id);
+	// Diagnostics: one line per cached image overlapping the range.
+	[[nodiscard]] std::string DescribeImagesAt(uint64_t address, uint64_t size);
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {

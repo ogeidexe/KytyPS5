@@ -86,6 +86,18 @@ inline std::vector<uint64_t>& TracedPrograms() {
 	return ids;
 }
 
+// The draw or dispatch currently being recorded (GPU thread only), so buffer writes can be tagged
+// with their producer. kind: 'D' draw, 'C' dispatch.
+struct CurrentOperation {
+	char     kind   = 0;
+	uint64_t shader = 0, pixel = 0, submit = 0;
+	uint32_t marker = 0;
+};
+inline CurrentOperation& CurrentOp() {
+	static CurrentOperation op;
+	return op;
+}
+
 // Run once when a lost device is reported, after the checkpoint trail (diagnostics only).
 inline std::function<void()>& OnDeviceLost() {
 	static std::function<void()> hook;

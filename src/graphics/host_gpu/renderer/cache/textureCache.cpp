@@ -292,6 +292,26 @@ static bool GpuHazardVerifyEnabled() {
 	return enabled;
 }
 
+std::string TextureCache::DescribeImagesAt(uint64_t address, uint64_t size) {
+	std::string text;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "    image %u:%u guest=0x%" PRIx64 "+0x%" PRIx64 " %ux%ux%u layers=%u vkfmt=%d"
+		              " gpu_modified=%d render_target=%d\n",
+		              id.index, id.generation, image->info.data.address, image->info.data.size,
+		              image->info.extent.width, image->info.extent.height, image->info.extent.depth,
+		              image->info.resources.layers, static_cast<int>(image->info.pixel_format),
+		              image->IsGpuModified() ? 1 : 0, image->usage.render_target ? 1 : 0);
+		text += line;
+	}
+	return text;
+}
+
 void TextureCache::VerifyImageAlive(ImageId id, const char* use, uint64_t submit_id) {
 	if (!GpuHazardVerifyEnabled() || !id) {
 		return;

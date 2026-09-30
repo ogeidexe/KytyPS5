@@ -173,6 +173,7 @@ static HW::ModeControl DecodeModeControl(uint32_t value) {
 static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	HW::RenderControl r {};
 
+	r.raw                  = value;
 	r.depth_clear_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_CLEAR_ENABLE) != 0;
 	r.stencil_clear_enable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_CLEAR_ENABLE) != 0;
 	r.resummarize_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, RESUMMARIZE_ENABLE) != 0;
@@ -319,6 +320,7 @@ static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_off
                                          uint32_t value) {
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
+		control.raw                 = value;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
 		control.force_z_dirty       = (value & 0x08000000u) != 0;
 		control.force_stencil_valid = (value & 0x40000000u) != 0;
@@ -3156,6 +3158,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::DB_SHADER_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HW::DepthShaderControl db_shader_control {};
+		db_shader_control.raw        = value;
 		db_shader_control.other_bits = value & 0xFFFF908Eu;
 		db_shader_control.conservative_z_export_value =
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, CONSERVATIVE_Z_EXPORT);

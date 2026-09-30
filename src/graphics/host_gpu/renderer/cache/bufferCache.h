@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/gpuWaitDiagnostics.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -188,6 +189,25 @@ private:
 	};
 	// KYTY_GPU_HAZARD_VERIFY only: deleted buffers whose destruction is still deferred.
 	std::unordered_map<VkBuffer, RetiredBuffer> m_retired_buffers;
+
+public:
+	// KYTY_GPU_WAIT_DIAGNOSTICS only: the last shader write recorded over each buffer range.
+	struct WriterRecord {
+		uint64_t                                  size = 0;
+		Common::GpuWaitDiagnostics::CurrentOperation op;
+		uint64_t                                  tick = 0;
+	};
+	std::map<uint64_t, WriterRecord> m_writers;
+	[[nodiscard]] const WriterRecord* FindWriter(uint64_t address) const {
+		auto it = m_writers.upper_bound(address);
+		if (it == m_writers.begin()) {
+			return nullptr;
+		}
+		--it;
+		return address < it->first + it->second.size ? &it->second : nullptr;
+	}
+
+private:
 	void RetireHotPages(uint64_t vaddr, uint64_t size, bool wait);
 	bool VerifyWrittenBack(uint64_t page);
 	bool EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);

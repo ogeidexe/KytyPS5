@@ -1175,6 +1175,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	Common::GpuWaitDiagnostics::CurrentOp() = {'D', state.programs.vertex[0].id,
+	                                           state.programs.pixel.id, submit_id,
+	                                           GpuCheckpoints::GetState().next.load() & 0x3ffffu};
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1243,7 +1246,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto& clip = regs.GetClipControl();
 			const auto& vp   = regs.GetScreenViewport().viewports[0];
 			const auto& dc   = regs.GetDepthControl();
-			char        text[512];
+			char        text[1024];
 			std::snprintf(text, sizeof(text),
 			              "dx_clip_space=%d zclip_near_disable=%d zclip_far_disable=%d "
 			              "clip_disable=%d vtx_kill_or=%d clip_err_detect_disable=%d ucp=%u "
@@ -1283,6 +1286,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			              state.depth_info.depth_write_enable ? 1 : 0,
 			              static_cast<int>(state.depth_info.depth_compare_op));
 			slot.state += text;
+			{
+				// Raw guest registers with a GFX10 decode of DB_SHADER_CONTROL.
+				const auto& sh  = regs.GetShaderRegisters();
+				const auto  dsc = sh.db_shader_control.raw;
+				const auto& z   = regs.GetDepthRenderTarget();
+				std::snprintf(
+				    text, sizeof(text),
+				    " DB_SHADER_CONTROL=0x%08x{z_export=%u z_order=%u kill=%u cov_to_mask=%u"
+				    " mask_export=%u exec_on_hier_fail=%u exec_on_noop=%u depth_before_shader=%u"
+				    " conservative_z=%u dual_quad_disable=%u pops=%u}"
+				    " DB_RENDER_CONTROL=0x%08x DB_RENDER_OVERRIDE=0x%08x SPI_SHADER_Z_FORMAT=0x%08x"
+				    " SPI_PS_INPUT_ENA=0x%08x SPI_PS_INPUT_ADDR=0x%08x z_htile=%d z_expclear=%d"
+				    " z_slice=%u..%u htile_base=0x%" PRIx64 " z_read=0x%" PRIx64 " z_write=0x%" PRIx64,
+				    dsc, dsc & 1u, (dsc >> 4) & 3u, (dsc >> 6) & 1u, (dsc >> 7) & 1u, (dsc >> 8) & 1u,
+				    (dsc >> 9) & 1u, (dsc >> 10) & 1u, (dsc >> 12) & 1u, (dsc >> 13) & 3u,
+				    (dsc >> 15) & 1u, (dsc >> 16) & 1u, regs.GetRenderControl().raw,
+				    regs.GetDepthRenderOverride().raw, sh.shader_z_format, sh.ps_input_ena,
+				    sh.ps_input_addr, z.z_info.htile_acceleration ? 1 : 0,
+				    z.z_info.expclear_enabled ? 1 : 0, static_cast<unsigned>(z.depth_view.slice_start),
+				    static_cast<unsigned>(z.depth_view.slice_max),
+				    static_cast<uint64_t>(z.htile_data_base_addr),
+				    static_cast<uint64_t>(z.z_read_base_addr), static_cast<uint64_t>(z.z_write_base_addr));
+				slot.state += text;
+			}
 			{
 				// Log each distinct bias configuration once, so the values are known even from
 				// runs that do not lose the device.

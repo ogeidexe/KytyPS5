@@ -1080,6 +1080,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		VerifyCoherence(buffer, vaddr, size);
 	}
 	if (is_written) {
+		if (Common::GpuWaitDiagnostics::Enabled()) {
+			if (m_writers.size() > 200000) {
+				m_writers.clear();
+			}
+			m_writers[vaddr] = {size, Common::GpuWaitDiagnostics::CurrentOp(),
+			                    m_scheduler.CurrentTick()};
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 		ForgetKnownFills(vaddr, size);
