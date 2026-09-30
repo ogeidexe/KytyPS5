@@ -561,6 +561,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                     = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	if (std::getenv("KYTY_TRACE_STATS") != nullptr) {
+		// Diagnostics only: per-draw fragment statistics of the traced draws (renderDraw.cpp).
+		device_features.pipelineStatisticsQuery = supported_features2.features.pipelineStatisticsQuery;
+		device_features.occlusionQueryPrecise   = supported_features2.features.occlusionQueryPrecise;
+	}
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
@@ -630,6 +635,26 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 		fault_features.deviceFault = VK_TRUE;
 		fault_features.pNext       = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &fault_features;
+	}
+	// Diagnostics only (KYTY_NV_DIAG_CONFIG=<hex flags>, empty = all): the driver keeps shader
+	// debug info, resource tracking and automatic checkpoints for its crash dump. It changes driver
+	// behavior and timing, so runs with it are not comparable to the baseline.
+	VkDeviceDiagnosticsConfigCreateInfoNV diag_config {};
+	diag_config.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
+	if (std::any_of(device_extensions.begin(), device_extensions.end(), [](const char* name) {
+		    return std::strcmp(name, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME) == 0;
+	    })) {
+		const char* flags = std::getenv("KYTY_NV_DIAG_CONFIG");
+		diag_config.flags = (flags != nullptr && flags[0] != '\0')
+		                        ? static_cast<VkDeviceDiagnosticsConfigFlagsNV>(
+		                              std::strtoul(flags, nullptr, 16))
+		                        : (VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
+		                           VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+		                           VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV |
+		                           VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV);
+		diag_config.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &diag_config;
+		LOGF("Vulkan NV diagnostics config: flags=0x%x\n", diag_config.flags);
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1030,6 +1055,10 @@ void WindowContext::CreateVulkan() {
 		if (Common::GpuWaitDiagnostics::Enabled() &&
 		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (std::getenv("KYTY_NV_DIAG_CONFIG") != nullptr &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions,
 		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&

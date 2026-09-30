@@ -666,6 +666,70 @@ struct TracedDrawCapture {
 	uint64_t                   next = 0;
 };
 
+// KYTY_TRACE_STATS=1 (with the default full trace mode): fragment shader invocations and samples
+// passed (fragments that survived kill and the depth test, i.e. late depth writes) per traced
+// draw, to compare the draw's real fragment workload with the standalone replay's.
+struct TracedDrawStats {
+	static constexpr uint32_t Count = 256;
+	vk::QueryPool             statistics;
+	vk::QueryPool             occlusion;
+	uint64_t                  issued = 0;
+	uint64_t                  read   = 0;
+	double                    sum[3] {};
+	double                    max[3] {};
+};
+
+static TracedDrawStats* GetTracedDrawStats(vk::Device device) {
+	static const bool enabled = std::getenv("KYTY_TRACE_STATS") != nullptr;
+	if (!enabled) {
+		return nullptr;
+	}
+	static TracedDrawStats stats = [device] {
+		TracedDrawStats s;
+		vk::QueryPoolCreateInfo info {};
+		info.queryType          = vk::QueryType::ePipelineStatistics;
+		info.queryCount         = TracedDrawStats::Count;
+		info.pipelineStatistics = vk::QueryPipelineStatisticFlagBits::eClippingPrimitives |
+		                          vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations;
+		s.statistics            = device.createQueryPool(info).value;
+		info.queryType          = vk::QueryType::eOcclusion;
+		info.pipelineStatistics = {};
+		s.occlusion             = device.createQueryPool(info).value;
+		return s;
+	}();
+	return &stats;
+}
+
+// Collects the result of the query about to be reused (written TracedDrawStats::Count traced draws
+// ago, so long finished unless the GPU is stuck) and prints a running summary.
+static void CollectTracedDrawStats(vk::Device device, TracedDrawStats& s, uint32_t index) {
+	if (s.issued < TracedDrawStats::Count) {
+		return;
+	}
+	uint64_t st[3] {}, occ[2] {};
+	const auto flags = vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability;
+	if (device.getQueryPoolResults(s.statistics, index, 1, sizeof(st), st, sizeof(st), flags) !=
+	        vk::Result::eSuccess ||
+	    device.getQueryPoolResults(s.occlusion, index, 1, sizeof(occ), occ, sizeof(occ), flags) !=
+	        vk::Result::eSuccess ||
+	    st[2] == 0 || occ[1] == 0) {
+		return;
+	}
+	const double v[3] = {static_cast<double>(st[0]), static_cast<double>(st[1]),
+	                     static_cast<double>(occ[0])};
+	for (int i = 0; i < 3; i++) {
+		s.sum[i] += v[i];
+		s.max[i] = std::max(s.max[i], v[i]);
+	}
+	if (++s.read % 500 == 0) {
+		std::printf("[trace-stats] %" PRIu64 " traced draws: mean primitives %.0f, fragment "
+		            "invocations %.0f, samples passed %.0f; max %.0f / %.0f / %.0f\n",
+		            s.read, s.sum[0] / s.read, s.sum[1] / s.read, s.sum[2] / s.read, s.max[0],
+		            s.max[1], s.max[2]);
+		std::fflush(stdout);
+	}
+}
+
 static TracedDrawCapture& GetTracedDrawCapture() {
 	static TracedDrawCapture capture;
 	return capture;
@@ -1216,7 +1280,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
+	// KYTY_TRACE_MODE (diagnostic, traced draws only) separates what the capture below changes in
+	// the command stream: "split" only ends the rendering scope before the draw, "barrier" also
+	// records the two full barriers, "none" changes nothing (CPU-side bookkeeping only), default
+	// "full" also copies every range the draw reads.
+	int32_t                  stats_query = -1; // KYTY_TRACE_STATS query of this draw
+	static const std::string trace_mode = [] {
+		const char* value = std::getenv("KYTY_TRACE_MODE");
+		return std::string(value != nullptr ? value : "full");
+	}();
+	if (trace_mode != "full" &&
+	    Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
+		if (trace_mode == "split" || trace_mode == "barrier") {
+			m_context.GetCommandScheduler().EndRendering();
+		}
+		if (trace_mode == "barrier") {
+			vk::MemoryBarrier before {};
+			before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+			before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
+			                          nullptr, 0, nullptr);
+			vk::MemoryBarrier after {};
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eHostRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                          vk::PipelineStageFlagBits::eAllCommands |
+			                              vk::PipelineStageFlagBits::eHost,
+			                          {}, 1, &after, 0, nullptr, 0, nullptr);
+		}
+	} else if (Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
 		auto& capture = GetTracedDrawCapture();
 		if (!capture.storage) {
 			capture.storage = std::make_unique<Buffer>(
@@ -1392,6 +1485,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			slot.attributes.push_back(a);
 		}
 		m_context.GetCommandScheduler().EndRendering();
+		if (auto* stats = GetTracedDrawStats(m_context.GetGraphics().device); stats != nullptr) {
+			stats_query = static_cast<int32_t>(stats->issued++ % TracedDrawStats::Count);
+			CollectTracedDrawStats(m_context.GetGraphics().device, *stats,
+			                       static_cast<uint32_t>(stats_query));
+			vk_buffer.resetQueryPool(stats->statistics, stats_query, 1);
+			vk_buffer.resetQueryPool(stats->occlusion, stats_query, 1);
+		}
 		const auto dst    = capture.storage->Handle();
 		uint64_t   cursor = 0;
 		std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
@@ -1543,12 +1643,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const char* value = std::getenv("KYTY_DIAG_DEPTH");
 		return value != nullptr && std::strcmp(value, "skip") == 0;
 	}();
+	auto* stats = stats_query >= 0 ? GetTracedDrawStats(m_context.GetGraphics().device) : nullptr;
+	if (stats != nullptr) {
+		vk_buffer.beginQuery(stats->statistics, stats_query, {});
+		vk_buffer.beginQuery(stats->occlusion, stats_query, vk::QueryControlFlagBits::ePrecise);
+	}
 	if (diag_skip && Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
 		// KYTY_DIAG_DEPTH=skip: diagnostic only, the traced draws are not emitted at all.
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	}
+	if (stats != nullptr) {
+		vk_buffer.endQuery(stats->occlusion, stats_query);
+		vk_buffer.endQuery(stats->statistics, stats_query);
 	}
 
 	if (!draw.IsIndexed()) {

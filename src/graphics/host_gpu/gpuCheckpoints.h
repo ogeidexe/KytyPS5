@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -92,15 +93,34 @@ inline void ReportDeviceFault(State& s) {
 	}
 	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
 	std::vector<VkDeviceFaultVendorInfoEXT>  vendor(counts.vendorInfoCount);
+	// The vendor binary is the driver's own crash dump; on NVIDIA a hang produces only this (no
+	// address or vendor records).
+	std::vector<uint8_t>                     binary(static_cast<size_t>(counts.vendorBinarySize));
 	VkDeviceFaultInfoEXT                     info {};
 	info.sType             = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
 	info.pAddressInfos     = addresses.data();
 	info.pVendorInfos      = vendor.data();
-	counts.vendorBinarySize = 0; // not requested
+	info.pVendorBinaryData = binary.empty() ? nullptr : binary.data();
 	const auto result      = s.get_fault(s.device, &counts, &info);
-	std::printf("[gpu-wait] device fault (%d): \"%s\", %u address record(s), %u vendor record(s)\n",
+	std::printf("[gpu-wait] device fault (%d): \"%s\", %u address record(s), %u vendor record(s), "
+	            "%" PRIu64 " byte vendor binary\n",
 	            static_cast<int>(result), info.description, counts.addressInfoCount,
-	            counts.vendorInfoCount);
+	            counts.vendorInfoCount, static_cast<uint64_t>(counts.vendorBinarySize));
+	if (binary.size() >= sizeof(VkDeviceFaultVendorBinaryHeaderVersionOneEXT)) {
+		VkDeviceFaultVendorBinaryHeaderVersionOneEXT header {};
+		std::memcpy(&header, binary.data(), sizeof(header));
+		std::printf("[gpu-wait]   vendor binary header: size=%u version=%d vendor=0x%04x "
+		            "device=0x%04x driver=0x%08x api=0x%08x\n",
+		            header.headerSize, static_cast<int>(header.headerVersion), header.vendorID,
+		            header.deviceID, header.driverVersion, header.apiVersion);
+	}
+	if (!binary.empty()) {
+		if (FILE* f = std::fopen("gpu_fault.nv-gpudmp", "wb")) {
+			std::fwrite(binary.data(), 1, binary.size(), f);
+			std::fclose(f);
+			std::printf("[gpu-wait]   vendor binary saved to gpu_fault.nv-gpudmp\n");
+		}
+	}
 	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
 		// Types: 1 read-invalid, 2 write-invalid, 3 execute-invalid, 4 IP unknown, 5 IP invalid,
 		// 6 IP fault.
