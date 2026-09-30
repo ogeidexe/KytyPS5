@@ -896,6 +896,121 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+static bool BufferVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_VERIFY");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::VerifyCoherence(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// Diagnostics only. Bounded per tick so a heavy frame stays playable while verifying.
+	constexpr uint64_t MaxRangeBytes = 4 * 1024 * 1024;
+	constexpr uint64_t MaxTickBytes  = 32 * 1024 * 1024;
+	struct Stats {
+		uint64_t tick = 0, tick_bytes = 0, ranges = 0, bytes = 0, mismatches = 0, skipped = 0;
+		uint64_t last_report = 0;
+	};
+	static Stats stats;
+	const auto   tick = m_scheduler.CurrentTick();
+	if (stats.tick != tick) {
+		stats.tick       = tick;
+		stats.tick_bytes = 0;
+	}
+	if (size == 0 || size > MaxRangeBytes || stats.tick_bytes + size > MaxTickBytes) {
+		stats.skipped++;
+		return;
+	}
+
+	// Snapshot first, then classify: a page still clean after the snapshot was not written since
+	// its last upload, because the first write to a clean page faults and marks it dirty before
+	// the write lands. The GPU copy must equal the snapshot on such pages.
+	std::vector<uint8_t> guest(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, guest.data(), size)) {
+		stats.skipped++;
+		return;
+	}
+	struct Piece {
+		uint64_t offset, bytes;
+	};
+	std::vector<Piece> clean;
+	for (uint64_t address = vaddr; address < vaddr + size;) {
+		const auto next  = std::min(Common::AlignDown(address, TRACKER_PAGE_SIZE) + TRACKER_PAGE_SIZE,
+		                            vaddr + size);
+		const auto bytes = next - address;
+		const bool dirty = m_memory_tracker.IsRegionCpuModified(address, bytes) ||
+		                   m_memory_tracker.IsRegionGpuModified(address, bytes) ||
+		                   m_gpu_modified_ranges.Intersects(address, bytes) ||
+		                   m_eager_pending_ranges.Intersects(address, bytes) ||
+		                   m_texture_cache.IsRegionGpuModified(address, bytes);
+		if (!dirty) {
+			if (!clean.empty() && clean.back().offset + clean.back().bytes == address - vaddr) {
+				clean.back().bytes += bytes;
+			} else {
+				clean.push_back({address - vaddr, bytes});
+			}
+		}
+		address = next;
+	}
+	if (clean.empty()) {
+		stats.skipped++;
+		return;
+	}
+	stats.tick_bytes += size;
+
+	auto readback = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         vk::BufferUsageFlagBits::eTransferDst, size);
+	readback->CopyFrom(m_scheduler.Current(), buffer, buffer.Offset(vaddr), 0, size,
+	                   vk::AccessFlagBits::eMemoryWrite,
+	                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	                   vk::AccessFlagBits::eHostRead);
+	m_scheduler.DeferOperation([readback = std::move(readback), guest = std::move(guest),
+	                            clean = std::move(clean), vaddr, size, tick,
+	                            buffer_base = buffer.CpuAddress()]() mutable {
+		readback->Invalidate(0, size);
+		const auto* gpu = readback->Mapped().data();
+		stats.ranges++;
+		stats.bytes += size;
+		for (const auto& piece: clean) {
+			if (std::memcmp(gpu + piece.offset, guest.data() + piece.offset, piece.bytes) == 0) {
+				continue;
+			}
+			uint64_t first = piece.offset, differing = 0;
+			while (gpu[first] == guest[first]) {
+				first++;
+			}
+			for (uint64_t i = piece.offset; i < piece.offset + piece.bytes; i++) {
+				differing += gpu[i] != guest[i] ? 1 : 0;
+			}
+			if (++stats.mismatches <= 64) {
+				uint32_t gpu_words[4] {}, guest_words[4] {};
+				const auto aligned = first & ~uint64_t {3};
+				const auto avail   = std::min<uint64_t>(sizeof(gpu_words), size - aligned);
+				std::memcpy(gpu_words, gpu + aligned, avail);
+				std::memcpy(guest_words, guest.data() + aligned, avail);
+				std::printf("[buf-verify] STALE range=0x%" PRIx64 "+0x%" PRIx64 " buffer=0x%" PRIx64
+				            " tick=%" PRIu64 " at=0x%" PRIx64 " clean_piece=+0x%" PRIx64
+				            "+0x%" PRIx64 " differing=%" PRIu64
+				            " gpu=%08x %08x %08x %08x guest=%08x %08x %08x %08x\n",
+				            vaddr, size, buffer_base, tick, vaddr + first, piece.offset, piece.bytes,
+				            differing, gpu_words[0], gpu_words[1], gpu_words[2], gpu_words[3],
+				            guest_words[0], guest_words[1], guest_words[2], guest_words[3]);
+				std::fflush(stdout);
+			}
+			break;
+		}
+		if (stats.ranges - stats.last_report >= 20000) {
+			stats.last_report = stats.ranges;
+			std::printf("[buf-verify] checked=%" PRIu64 " bytes=%" PRIu64 " stale=%" PRIu64
+			            " skipped=%" PRIu64 "\n",
+			            stats.ranges, stats.bytes, stats.mismatches, stats.skipped);
+			std::fflush(stdout);
+		}
+	});
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -923,6 +1038,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (!is_written && BufferVerifyEnabled()) {
+		VerifyCoherence(buffer, vaddr, size);
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();

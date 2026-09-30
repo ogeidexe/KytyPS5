@@ -136,6 +136,9 @@ private:
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
+	// KYTY_BUFFER_VERIFY=1 only: checks that the GPU copy of a range about to be read matches
+	// guest memory on every page neither side has modified since the last synchronization.
+	void VerifyCoherence(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
