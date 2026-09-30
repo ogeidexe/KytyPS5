@@ -40,9 +40,32 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Descriptor values as evaluated, before validation zeroes invalid ones. Inactive sources hold
+// zero dwords, exactly as MaterializeResources produced them.
+struct RawDescriptors {
+	std::vector<DescriptorValue> buffers;
+	std::vector<DescriptorValue> images;
+	std::vector<DescriptorValue> samplers;
+	std::vector<uint8_t>         active; // per descriptor source; empty means all active
+};
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// raw, when given, receives the evaluated descriptors (only for plans that SupportsRematerialize).
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          RawDescriptors* raw = nullptr);
+
+// Plans whose outputs are fully determined by their evaluated descriptors plus the parts of the
+// snapshot that do not depend on descriptor values: no captured specialization reads and no
+// indirect images.
+bool SupportsRematerialize(const ResourcePlan& program);
+
+// The tail of MaterializeResources for already evaluated descriptors: validation, the user data
+// copy and specialization. The flattened SRT and uniform fill in snapshot are left as they are.
+// For identical raw descriptors and runtime this produces exactly what MaterializeResources did.
+bool RematerializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                            const RawDescriptors& raw, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

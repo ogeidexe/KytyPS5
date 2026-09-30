@@ -41,6 +41,11 @@ inline std::atomic<uint32_t> g_srt_miss_inputs {0};
 inline std::atomic<uint32_t> g_srt_miss_memory {0};
 inline std::atomic<uint64_t> g_srt_checked_reads {0};
 inline std::atomic<uint32_t> g_srt_mismatches {0};
+// User data words hashed for SRT cache lookups, and dependency masks widened (tables emptied).
+inline std::atomic<uint64_t> g_srt_dependency_words {0};
+inline std::atomic<uint32_t> g_srt_mask_resets {0};
+// SRT cache hits that substituted changed pass-through descriptor words (inline descriptors).
+inline std::atomic<uint32_t> g_srt_substituted {0};
 // Guest-CPU reads of GPU-written memory (a game thread faults and the GPU thread reads back):
 // count, time waiting for the GPU thread to service the request, time spent reading back, how
 // often the buffer's last GPU writer had already completed, and how often the open command buffer

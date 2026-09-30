@@ -502,6 +502,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 				return false;
 			}
+			if (m_runtime.observe_user_data != nullptr) {
+				m_runtime.observe_user_data(reg - m_program.user_data_base);
+			}
 			result = m_runtime.user_data[reg - m_program.user_data_base];
 			return true;
 		}
@@ -839,12 +842,40 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
 	result.dword_count = descriptor.dword_count;
-	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+	for (uint32_t index = 0; index < descriptor.dwords.size() && index < descriptor.dword_count;
+	     ++index) {
+		// A dword that is a user data word as-is (a descriptor stored inline in user data) is
+		// copied the way EvaluateInst would produce it, without the memo and without reporting a
+		// user data read: the word reaches the output verbatim and influences nothing else here,
+		// so a caller can substitute it (see PassThroughUserData). Any other use of the same word
+		// still evaluates normally and is reported.
+		if (const auto k = PassThroughUserData(m_program, descriptor.dwords[index]);
+		    k != UINT32_MAX) {
+			if (k >= m_runtime.user_data.size()) {
+				return false;
+			}
+			result.dwords[index] = m_runtime.user_data[k];
+			continue;
+		}
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
 		}
 	}
 	return true;
+}
+
+uint32_t PassThroughUserData(const ResourcePlan& program, Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return UINT32_MAX;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetUserData || inst->NumArgs() != 1 ||
+	    inst->Arg(0).GetType() != Type::ScalarReg) {
+		return UINT32_MAX;
+	}
+	const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+	return reg < program.user_data_base ? UINT32_MAX : reg - program.user_data_base;
 }
 
 std::span<const uint8_t> SrtWalker::FindActiveSources() {

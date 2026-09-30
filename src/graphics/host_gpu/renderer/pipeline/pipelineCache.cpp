@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -130,6 +131,8 @@ struct SrtTrace {
 	std::vector<uint32_t>                        words;
 	ShaderRecompiler::IR::ResourceSnapshot       resources;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	// Descriptors before validation, for rebuilding the outputs with other pass-through words.
+	ShaderRecompiler::IR::RawDescriptors         raw;
 
 	void Clear() {
 		valid = false;
@@ -169,6 +172,49 @@ void RecordRawRead(uint64_t address, uint32_t value) {
 	if (g_srt_recording != nullptr) {
 		g_srt_recording->Add(SrtTraceRecord::Kind::Raw, true, address, sizeof(value), {&value, 1});
 	}
+}
+
+// User data words read by the evaluation being recorded, one bit per word. ShaderParams carries at
+// most 40 user data words; an index past 63 marks every word as a dependency.
+thread_local uint64_t g_srt_user_data_read = 0;
+
+void RecordUserDataRead(uint32_t index) {
+	g_srt_user_data_read |= index < 64 ? uint64_t {1} << index : ~uint64_t {0};
+}
+
+// Hash of the cache inputs: the shader base, the user data count and the user data words selected
+// by mask. No other word can influence the evaluation (see SourceEntry::srt_user_data_mask).
+uint64_t SrtInputHash(std::span<const uint32_t> user_data, uint64_t shader_base, uint64_t mask,
+                      uint32_t* words_examined) {
+	std::array<uint32_t, 66> key {};
+	uint32_t                 n = 0;
+	key[n++]                   = static_cast<uint32_t>(user_data.size());
+	key[n++]                   = static_cast<uint32_t>(shader_base >> 32u);
+	for (uint64_t bits = mask; bits != 0; bits &= bits - 1) {
+		const auto index = static_cast<uint32_t>(std::countr_zero(bits));
+		if (index >= user_data.size()) {
+			break; // past the end GetUserData fails; the count above already tells sizes apart
+		}
+		key[n++] = user_data[index];
+	}
+	*words_examined = n - 2;
+	return XXH3_64bits_withSeed(key.data(), n * sizeof(uint32_t), shader_base);
+}
+
+bool SameSrtInputs(std::span<const uint32_t> a, std::span<const uint32_t> b, uint64_t mask) {
+	if (a.size() != b.size()) {
+		return false;
+	}
+	for (uint64_t bits = mask; bits != 0; bits &= bits - 1) {
+		const auto index = static_cast<size_t>(std::countr_zero(bits));
+		if (index >= a.size()) {
+			break;
+		}
+		if (a[index] != b[index]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // Re-runs every recorded access in order; true when each returns exactly what it returned before.
@@ -364,7 +410,82 @@ struct PipelineCache::ProgramCache {
 		uint32_t                                    srt_current  = UINT32_MAX; // outputs held
 		bool                                        srt_disabled = false; // verification mismatch
 		uint32_t                                    srt_hits_since_verify = 0;
+		// User data words any recorded evaluation of this program has read. Evaluation reads user
+		// data only through GetUserData, so a trace's result depends on the shader base, the words
+		// it read and its recorded memory accesses, never on the other words. Every trace is
+		// recorded while observing its reads and the table is emptied whenever this mask grows, so
+		// each stored trace's read set is inside the mask: matching the masked words (plus the
+		// memory records) is as strong as matching the whole array, while draws that differ only
+		// in words the resource plan never reads (per-object constants, offsets) now hit.
+		uint64_t                                    srt_user_data_mask = 0;
+		// Descriptor dwords that are user data words copied verbatim (inline descriptors, whose
+		// address word typically changes every draw). EvaluateDescriptor does not report them as
+		// reads, so they stay out of the mask; a hit substitutes the current words into the
+		// trace's raw descriptors and redoes validation and specialization. Plans that cannot be
+		// rematerialized key on every word instead (mask = ~0).
+		struct PassThrough {
+			uint8_t  kind; // 0 buffer, 1 image, 2 sampler
+			uint8_t  dword;
+			uint16_t index; // into info.buffers/images/samplers
+			uint32_t source;
+			uint32_t user_data;
+		};
+		bool                                        srt_prepared = false;
+		bool                                        srt_rematerialize = false;
+		std::vector<PassThrough>                    srt_pass_through;
+		ShaderRecompiler::IR::RawDescriptors        srt_scratch;
 	};
+
+	static void PrepareSrtCache(SourceEntry& entry) {
+		entry.srt_prepared      = true;
+		const auto& plan        = entry.resource_plan;
+		entry.srt_rematerialize = ShaderRecompiler::IR::SupportsRematerialize(plan);
+		if (!entry.srt_rematerialize) {
+			entry.srt_user_data_mask = ~uint64_t {0};
+			return;
+		}
+		const auto add = [&](uint8_t kind, size_t index, uint32_t source) {
+			if (source >= plan.descriptor_sources.size()) {
+				return;
+			}
+			const auto& descriptor = plan.descriptor_sources[source];
+			for (uint32_t j = 0; j < descriptor.dwords.size() && j < descriptor.dword_count; j++) {
+				const auto k = ShaderRecompiler::IR::PassThroughUserData(plan, descriptor.dwords[j]);
+				if (k != UINT32_MAX) {
+					entry.srt_pass_through.push_back({kind, static_cast<uint8_t>(j),
+					                                  static_cast<uint16_t>(index), source, k});
+				}
+			}
+		};
+		for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+			add(0, i, plan.info.buffers[i].source);
+		}
+		for (size_t i = 0; i < plan.info.images.size(); i++) {
+			add(1, i, plan.info.images[i].source);
+		}
+		for (size_t i = 0; i < plan.info.samplers.size(); i++) {
+			add(2, i, plan.info.samplers[i].source);
+		}
+	}
+
+	// Writes the current pass-through words into raw; true when any of them changed.
+	static bool SubstitutePassThrough(const SourceEntry&                    entry,
+	                                  std::span<const uint32_t>             user_data,
+	                                  ShaderRecompiler::IR::RawDescriptors& raw) {
+		bool changed = false;
+		for (const auto& p: entry.srt_pass_through) {
+			if (!raw.active.empty() && (p.source >= raw.active.size() || raw.active[p.source] == 0)) {
+				continue; // an inactive source evaluates to zero dwords, not to user data
+			}
+			auto& list = p.kind == 0 ? raw.buffers : p.kind == 1 ? raw.images : raw.samplers;
+			auto& word = list[p.index].dwords[p.dword];
+			if (word != user_data[p.user_data]) {
+				word    = user_data[p.user_data];
+				changed = true;
+			}
+		}
+		return changed;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -424,14 +545,20 @@ struct PipelineCache::ProgramCache {
 			if (entry.srt_traces.empty()) {
 				entry.srt_traces.resize(Slots);
 			}
-			const uint64_t key_hash =
-			    XXH3_64bits_withSeed(runtime.user_data.data(), runtime.user_data.size_bytes(),
-			                         runtime.shader_base);
+			if (!entry.srt_prepared) {
+				PrepareSrtCache(entry);
+			}
+			uint32_t       examined = 0;
+			const uint64_t key_hash = SrtInputHash(runtime.user_data, runtime.shader_base,
+			                                       entry.srt_user_data_mask, &examined);
+			Common::FrameStats::g_srt_dependency_words.fetch_add(examined,
+			                                                     std::memory_order_relaxed);
 			slot  = static_cast<uint32_t>(key_hash & (Slots - 1u));
 			trace = &entry.srt_traces[slot];
-			const bool same_inputs = trace->valid && trace->key_hash == key_hash &&
-			                         trace->shader_base == runtime.shader_base &&
-			                         std::ranges::equal(trace->user_data, runtime.user_data);
+			const bool same_inputs =
+			    trace->valid && trace->key_hash == key_hash &&
+			    trace->shader_base == runtime.shader_base &&
+			    SameSrtInputs(trace->user_data, runtime.user_data, entry.srt_user_data_mask);
 			if (!same_inputs) {
 				Common::FrameStats::g_srt_miss_inputs.fetch_add(1, std::memory_order_relaxed);
 			} else if (!SrtTraceStillValid(*trace)) {
@@ -440,10 +567,32 @@ struct PipelineCache::ProgramCache {
 				Common::FrameStats::g_srt_hits.fetch_add(1, std::memory_order_relaxed);
 				Common::FrameStats::g_srt_checked_reads.fetch_add(trace->records.size(),
 				                                                  std::memory_order_relaxed);
-				if (entry.srt_current != slot) {
-					entry.resources      = trace->resources;
+				bool substituted = false;
+				if (entry.srt_rematerialize && !entry.srt_pass_through.empty()) {
+					// The pass-through words are all in range: the trace evaluated them.
+					entry.srt_scratch = trace->raw;
+					substituted = SubstitutePassThrough(entry, runtime.user_data, entry.srt_scratch);
+				}
+				if (substituted) {
+					Common::FrameStats::g_srt_substituted.fetch_add(1, std::memory_order_relaxed);
+					entry.resources      = trace->resources; // flattened SRT and uniform fill
 					entry.specialization = trace->specialization;
-					entry.srt_current    = slot;
+					EXIT_IF(!ShaderRecompiler::IR::RematerializeResources(
+					    entry.resource_plan, runtime, entry.srt_scratch, entry.resources,
+					    entry.specialization));
+					entry.srt_current = UINT32_MAX; // no longer the trace's own outputs
+				} else {
+					if (entry.srt_current != slot) {
+						entry.resources      = trace->resources;
+						entry.specialization = trace->specialization;
+						entry.srt_current    = slot;
+					}
+					// The snapshot also carries a plain copy of the user data (push data, draw
+					// offsets): the one output that follows every word, so refresh it.
+					if (!std::ranges::equal(entry.resources.user_data, runtime.user_data)) {
+						entry.resources.user_data.assign(runtime.user_data.begin(),
+						                                 runtime.user_data.end());
+					}
 				}
 				const auto verify = SrtCacheVerifyInterval();
 				if (verify == 0 || ++entry.srt_hits_since_verify < verify) {
@@ -460,9 +609,10 @@ struct PipelineCache::ProgramCache {
 				}
 				Common::FrameStats::g_srt_mismatches.fetch_add(1, std::memory_order_relaxed);
 				std::printf("SRT CACHE MISMATCH: program=0x%016" PRIx64 " base=0x%016" PRIx64
-				            " user_data=%zu recorded_reads=%zu; caching disabled for this program\n",
+				            " user_data=%zu recorded_reads=%zu mask=0x%016" PRIx64
+				            "; caching disabled for this program\n",
 				            program_hash, runtime.shader_base, runtime.user_data.size(),
-				            trace->records.size());
+				            trace->records.size(), entry.srt_user_data_mask);
 				entry.srt_disabled = true;
 				entry.srt_traces.clear();
 				entry.srt_current    = UINT32_MAX;
@@ -482,14 +632,39 @@ struct PipelineCache::ProgramCache {
 			recording.read_specialization_memory = RecordStrictRead;
 			recording.validate_memory_range      = RecordValidate;
 			recording.observe_raw_read           = RecordRawRead;
+			recording.observe_user_data          = RecordUserDataRead;
 			g_srt_recording                      = trace;
+			g_srt_user_data_read                 = 0;
 		}
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
-		    entry.resource_plan, recording, entry.resources, entry.specialization);
+		    entry.resource_plan, recording, entry.resources, entry.specialization,
+		    trace != nullptr && entry.srt_rematerialize ? &trace->raw : nullptr);
 		g_srt_recording = nullptr;
 		EXIT_IF(!ok);
 		entry.srt_current = UINT32_MAX;
 		if (trace != nullptr) {
+			if ((g_srt_user_data_read & ~entry.srt_user_data_mask) != 0) {
+				// This evaluation read a word no stored trace was keyed on. Widen the mask, drop
+				// every other trace (their keys and slots were computed without that word) and
+				// file this one under the widened key.
+				entry.srt_user_data_mask |= g_srt_user_data_read;
+				Common::FrameStats::g_srt_mask_resets.fetch_add(1, std::memory_order_relaxed);
+				uint32_t       unused  = 0;
+				const uint64_t widened = SrtInputHash(runtime.user_data, runtime.shader_base,
+				                                      entry.srt_user_data_mask, &unused);
+				const auto     widened_slot = static_cast<uint32_t>(widened & (Slots - 1u));
+				for (uint32_t i = 0; i < Slots; i++) {
+					if (i != slot) {
+						entry.srt_traces[i].Clear();
+					}
+				}
+				if (widened_slot != slot) {
+					std::swap(entry.srt_traces[widened_slot], entry.srt_traces[slot]);
+				}
+				slot            = widened_slot;
+				trace           = &entry.srt_traces[slot];
+				trace->key_hash = widened;
+			}
 			trace->resources      = entry.resources;
 			trace->specialization = entry.specialization;
 			trace->valid          = true;

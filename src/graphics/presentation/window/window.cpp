@@ -1010,14 +1010,19 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_indirect_speculated.exchange(0),
 			            Common::FrameStats::g_indirect_stall_us.exchange(0) / 1000.0);
 			std::printf("[frame-stats]   srt_evals=%u srt_hits=%u srt_miss_inputs=%u"
-			            " srt_miss_memory=%u srt_checked_reads=%llu srt_mismatches=%u\n",
+			            " srt_miss_memory=%u srt_checked_reads=%llu srt_mismatches=%u"
+			            " srt_dep_words=%llu srt_mask_resets=%u srt_subst=%u\n",
 			            Common::FrameStats::g_srt_evaluations.exchange(0),
 			            Common::FrameStats::g_srt_hits.exchange(0),
 			            Common::FrameStats::g_srt_miss_inputs.exchange(0),
 			            Common::FrameStats::g_srt_miss_memory.exchange(0),
 			            static_cast<unsigned long long>(
 			                Common::FrameStats::g_srt_checked_reads.exchange(0)),
-			            Common::FrameStats::g_srt_mismatches.exchange(0));
+			            Common::FrameStats::g_srt_mismatches.exchange(0),
+			            static_cast<unsigned long long>(
+			                Common::FrameStats::g_srt_dependency_words.exchange(0)),
+			            Common::FrameStats::g_srt_mask_resets.exchange(0),
+			            Common::FrameStats::g_srt_substituted.exchange(0));
 			std::printf("[frame-stats]   cpu_reads=%u cpu_read_service=%.1fms cpu_read_readback=%.1fms"
 			            " producer_done=%u needed_flush=%u eager_scheduled=%u eager_retired=%u"
 			            " dep_mismatches=%u eager_skipped=%u\n",

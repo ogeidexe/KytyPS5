@@ -22,6 +22,9 @@ struct SrtRuntime {
 	// Told about every word read directly from guest memory (the read_memory == nullptr path).
 	// It observes only and cannot change the value, so evaluation is unaffected.
 	void (*observe_raw_read)(uint64_t address, uint32_t value) = nullptr;
+	// Told the index of every user data word the evaluation reads (GetUserData is the only way it
+	// reads user data). Observes only, like observe_raw_read.
+	void (*observe_user_data)(uint32_t index) = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -30,6 +33,9 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+// The user data index a descriptor dword copies verbatim (the value is GetUserData itself), or
+// UINT32_MAX. EvaluateDescriptor reads such dwords without reporting them to observe_user_data.
+uint32_t PassThroughUserData(const ResourcePlan& program, Value value);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {

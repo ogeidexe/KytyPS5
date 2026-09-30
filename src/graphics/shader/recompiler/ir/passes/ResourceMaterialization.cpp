@@ -988,8 +988,26 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+static ResourceSpecialization::Image StaticImageSpecialization(const ImageResource& image) {
+	return {
+	    .numeric_class = image.numeric_class,
+	    .dimension = image.dimension,
+	    .mip_count = image.mip_count,
+	    .conversion_format = image.conversion_format,
+	    .shader_swizzle = image.shader_swizzle,
+	    .indirect_root = image.indirect_root,
+	    .indirect_mapping_offset = image.indirect_mapping_offset,
+	    .indirect_search_iterations = image.indirect_search_iterations,
+	    .cube = image.cube,
+	};
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          RawDescriptors* raw) {
+	if (raw != nullptr && !SupportsRematerialize(program)) {
+		raw = nullptr;
+	}
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1007,6 +1025,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
 	const auto active = clean.FindActiveSources();
+	if (raw != nullptr) {
+		raw->active.assign(active.begin(), active.end());
+		raw->buffers.resize(program.info.buffers.size());
+		raw->images.resize(program.info.images.size());
+		raw->samplers.resize(program.info.samplers.size());
+	}
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
@@ -1038,6 +1062,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
 			return false;
 		}
+		if (raw != nullptr) {
+			raw->buffers[i] = snapshot.buffers[i];
+		}
 		
 		ShaderBufferResource buffer;
 		if (!ValidBufferDescriptor(snapshot.buffers[i], program.stage, runtime, buffer)) {
@@ -1057,17 +1084,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
-		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
-		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		};
+		specialization.images[i] = StaticImageSpecialization(image);
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
 			return false;
@@ -1091,6 +1108,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!evaluate(image.source, snapshot.images[i])) {
 				return false;
 			}
+			if (raw != nullptr) {
+				raw->images[i] = snapshot.images[i];
+			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
 			}
@@ -1101,6 +1121,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
 			return false;
 		}
+		if (raw != nullptr) {
+			raw->samplers[i] = snapshot.samplers[i];
+		}
 
 		ShaderSamplerResource sampler;
 		if (!ValidSamplerDescriptor(snapshot.samplers[i], sampler)) {
@@ -1108,6 +1131,59 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
+	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool SupportsRematerialize(const ResourcePlan& program) {
+	if (!program.resource_tracking_complete || program.capture_specialization_reads) {
+		return false;
+	}
+	for (const auto& image: program.info.images) {
+		const auto* source = Source(program, image.source);
+		if (source == nullptr || source->indirect_image.has_value()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Mirrors the buffer, image and sampler loops of MaterializeResources for a plan without captured
+// specialization reads or indirect images, starting from the descriptors they evaluated.
+bool RematerializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                            const RawDescriptors& raw, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (!SupportsRematerialize(program) || raw.buffers.size() != program.info.buffers.size() ||
+	    raw.images.size() != program.info.images.size() ||
+	    raw.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	snapshot.buffers.resize(program.info.buffers.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		snapshot.buffers[i] = raw.buffers[i];
+		ShaderBufferResource buffer;
+		if (!ValidBufferDescriptor(snapshot.buffers[i], program.stage, runtime, buffer)) {
+			snapshot.buffers[i].dwords.fill(0);
+		}
+	}
+	snapshot.images.resize(program.info.images.size());
+	specialization.images.resize(program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image        = program.info.images[i];
+		specialization.images[i] = StaticImageSpecialization(image);
+		snapshot.images[i]       = raw.images[i];
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0);
+		}
+	}
+	snapshot.samplers.resize(program.info.samplers.size());
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		snapshot.samplers[i] = raw.samplers[i];
+		ShaderSamplerResource sampler;
+		if (!ValidSamplerDescriptor(snapshot.samplers[i], sampler)) {
+			snapshot.samplers[i].dwords.fill(0);
+		}
+	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
