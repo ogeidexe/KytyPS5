@@ -1109,6 +1109,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms result;
+	std::fill(std::begin(vertex_info[0].param_extra_location_plus1),
+	          std::end(vertex_info[0].param_extra_location_plus1), uint8_t {0});
+	if (pixel_active && !tess_active && !mesh_active) {
+		// Each SPI_PS_INPUT_CNTL entry picks its own interpolation for a vertex parameter; one
+		// parameter read both flat and smooth occupies two pixel input locations, so the vertex
+		// stage writes it to the second location as well. Same input set as the pixel emitter.
+		std::array<uint32_t, 32> active {};
+		const auto               active_count = std::min<uint32_t>(pixel_info.input_num, 32u);
+		for (uint32_t input = 0; input < active_count; input++) {
+			active[input] = input;
+		}
+		const std::span<const uint32_t> inputs {active.data(), active_count};
+		for (uint32_t input = 0; input < active_count; input++) {
+			if (ShaderPixelParameterUsesDefault(pixel_info, input)) {
+				continue;
+			}
+			const auto mapped   = ShaderPixelParameterMappedLocation(pixel_info, input);
+			const auto location = ShaderPixelParameterLocation(pixel_info, inputs, input);
+			if (location != mapped && mapped < 32u && location < 255u) {
+				vertex_info[0].param_extra_location_plus1[mapped] = static_cast<uint8_t>(location + 1u);
+			}
+		}
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}

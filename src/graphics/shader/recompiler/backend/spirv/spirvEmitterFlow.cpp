@@ -150,6 +150,11 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 }
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+	if (state.program.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterUsesDefault(*state.input_info.pixel, attr)) {
+		return ConstantU32(state,
+		                   ShaderPixelParameterDefaultBits(*state.input_info.pixel, attr, chan & 3u));
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -208,7 +213,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (!input->per_vertex || input->variable_id == 0) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {
@@ -564,6 +569,15 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (exp.kind == IR::ExportTargetKind::Parameter) {
+				// A parameter the pixel stage also reads at a second location.
+				for (const auto& binding: state.outputs) {
+					if (binding.kind == IR::StageOutputKind::Parameter && binding.index == exp.index &&
+					    binding.variable_id != 0 && binding.variable_id != variable) {
+						state.builder.AddFunction(spv::OpStore, binding.variable_id, value);
+					}
+				}
+			}
 		}
 	});
 }

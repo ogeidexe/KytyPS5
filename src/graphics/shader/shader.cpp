@@ -597,6 +597,7 @@ static void ShaderGetStaticInputInfoPS(
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
 	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	ps_info.vs_export_count      = sh.GetExportCount();
 	if ((sh.ps_in_control & 0x8000u) != 0) {
 		ps_info.wave_size = 32;
 	}
@@ -678,6 +679,11 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	for (uint32_t i = 0; i < 32u; i += 4u) {
+		uint32_t packed = 0;
+		std::memcpy(&packed, &info.param_extra_location_plus1[i], sizeof(packed));
+		key.push_back(packed);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -752,6 +758,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	}
 	key.insert(key.end(), std::begin(info.interpolator_settings),
 	           std::begin(info.interpolator_settings) + info.input_num);
+	key.push_back(info.vs_export_count);
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
