@@ -16,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace Common::GpuWaitDiagnostics {
 
@@ -76,6 +77,24 @@ inline void Dump(const char* header) {
 		            e.b, e.c, e.d);
 	}
 	std::fflush(stdout);
+}
+
+// KYTY_TRACE_VS=<hash>[,<hash>...]: program ids of those shaders, registered when they compile,
+// so draws using them can log their inputs. GPU thread only.
+inline std::vector<uint64_t>& TracedPrograms() {
+	static std::vector<uint64_t> ids;
+	return ids;
+}
+
+// Run once when a lost device is reported, after the checkpoint trail (diagnostics only).
+inline std::function<void()>& OnDeviceLost() {
+	static std::function<void()> hook;
+	return hook;
+}
+
+inline bool IsTracedProgram(uint64_t id) {
+	const auto& ids = TracedPrograms();
+	return !ids.empty() && std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
 } // namespace Common::GpuWaitDiagnostics

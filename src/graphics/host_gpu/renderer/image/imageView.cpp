@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -382,6 +384,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 
 	vk::ImageView view   = nullptr;
 	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+	ImageHistory::Record({m_scheduler.CurrentTick(), ImageHistory::Kind::ViewCreated, image.image,
+	                      view, 0, 0, normalized.base_level, normalized.base_layer,
+	                      normalized.layer_count, static_cast<uint32_t>(normalized.aspect)});
 	if (result != vk::Result::eSuccess || view == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
 		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",

@@ -45,6 +45,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -630,6 +631,104 @@ struct DrawIndexBufferSource {
 	uint32_t      guest_element_size = 0;
 };
 
+// KYTY_TRACE_VS only: GPU-side copies of every range a traced draw reads, taken by the command
+// buffer right before the draw, so after a device loss the inputs of the draw the GPU could not
+// finish can be compared with earlier draws of the same mesh. Host-visible memory stays readable
+// after the loss. The copies are small (one mesh) and cost no CPU scanning.
+struct TracedDrawCapture {
+	static constexpr uint32_t Slots     = 48;
+	static constexpr uint64_t SlotBytes = 1024 * 1024;
+	struct Range {
+		char     kind  = 0; // 'v' vertex buffer, 'i' index buffer, 's' storage buffer
+		uint32_t index = 0;
+		uint64_t guest = 0, size = 0, copied = 0, slot_offset = 0, host_offset = 0;
+		VkBuffer host  = VK_NULL_HANDLE;
+	};
+	struct Attribute {
+		uint32_t fields[4] {};
+		int      attr_id = -1, buffer_index = 0, registers_num = 0;
+		uint32_t fetch_index = 0;
+	};
+	struct Slot {
+		uint64_t               draw = 0, submit = 0, tick = 0;
+		uint32_t               marker = 0, index_count = 0, instances = 0, first_instance = 0;
+		uint64_t               vs = 0, ps = 0, index_address = 0;
+		int32_t                vertex_offset = 0;
+		uint32_t               index_type = 0;
+		std::vector<Range>     ranges;
+		std::vector<Attribute> attributes;
+		std::vector<uint32_t>  strides, num_records;
+		std::string            state;
+		std::vector<std::string> images;
+	};
+	std::unique_ptr<Buffer>    storage;
+	std::array<Slot, Slots>    slots;
+	uint64_t                   next = 0;
+};
+
+static TracedDrawCapture& GetTracedDrawCapture() {
+	static TracedDrawCapture capture;
+	return capture;
+}
+
+static void DumpTracedDrawCapture() {
+	auto& capture = GetTracedDrawCapture();
+	if (!capture.storage) {
+		return;
+	}
+	const auto* base = capture.storage->Mapped().data();
+	const auto  dir  = std::string("trace_capture");
+	(void)std::system(("mkdir " + dir + " 2>nul").c_str());
+	FILE* summary = std::fopen((dir + "/summary.txt").c_str(), "w");
+	if (summary == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < TracedDrawCapture::Slots; i++) {
+		const auto& slot = capture.slots[i];
+		if (slot.draw == 0) {
+			continue;
+		}
+		std::fprintf(summary,
+		             "draw %" PRIu64 " slot %u marker %u submit %" PRIu64 " tick %" PRIu64
+		             " vs %" PRIu64 " ps %" PRIu64 " indices %u instances %u first_instance %u"
+		             " vertex_offset %d index_type %u index_address 0x%" PRIx64 "\n",
+		             slot.draw, i, slot.marker, slot.submit, slot.tick, slot.vs, slot.ps,
+		             slot.index_count, slot.instances, slot.first_instance, slot.vertex_offset,
+		             slot.index_type, slot.index_address);
+		std::fprintf(summary, "  state %s\n", slot.state.c_str());
+		for (const auto& image: slot.images) {
+			std::fprintf(summary, "  image %s\n", image.c_str());
+		}
+		for (size_t b = 0; b < slot.strides.size(); b++) {
+			std::fprintf(summary, "  vbuf %zu stride %u num_records %u\n", b, slot.strides[b],
+			             slot.num_records[b]);
+		}
+		for (const auto& a: slot.attributes) {
+			std::fprintf(summary,
+			             "  attr %d buffer %d regs %d fetch %u vsharp %08x %08x %08x %08x\n",
+			             a.attr_id, a.buffer_index, a.registers_num, a.fetch_index, a.fields[0],
+			             a.fields[1], a.fields[2], a.fields[3]);
+		}
+		for (const auto& r: slot.ranges) {
+			const auto name = dir + "/d" + std::to_string(slot.draw) + "_" + r.kind +
+			                  std::to_string(r.index) + ".bin";
+			std::fprintf(summary,
+			             "  range %c%u guest 0x%" PRIx64 " size 0x%" PRIx64 " copied 0x%" PRIx64
+			             " host %p+0x%" PRIx64 " file %s\n",
+			             r.kind, r.index, r.guest, r.size, r.copied, static_cast<void*>(r.host),
+			             r.host_offset, name.c_str());
+			if (FILE* f = std::fopen(name.c_str(), "wb")) {
+				std::fwrite(base + uint64_t {i} * TracedDrawCapture::SlotBytes + r.slot_offset, 1,
+				            r.copied, f);
+				std::fclose(f);
+			}
+		}
+	}
+	std::fclose(summary);
+	std::printf("[trace-vs] wrote %s/summary.txt\n", dir.c_str());
+	std::fflush(stdout);
+}
+
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
@@ -1114,6 +1213,238 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	if (Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
+		auto& capture = GetTracedDrawCapture();
+		if (!capture.storage) {
+			capture.storage = std::make_unique<Buffer>(
+			    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::Download, 0,
+			    vk::BufferUsageFlagBits::eTransferDst,
+			    TracedDrawCapture::Slots * TracedDrawCapture::SlotBytes);
+			Common::GpuWaitDiagnostics::OnDeviceLost() = [] { DumpTracedDrawCapture(); };
+		}
+		static uint64_t traced_draws = 0;
+		const auto      slot_index   = capture.next++ % TracedDrawCapture::Slots;
+		auto&           slot         = capture.slots[slot_index];
+		slot                         = {};
+		slot.draw                    = ++traced_draws;
+		slot.submit                  = submit_id;
+		slot.tick                    = m_context.GetCommandScheduler().CurrentTick();
+		slot.marker                  = GpuCheckpoints::GetState().next.load();
+		slot.vs                      = state.programs.vertex[0].id;
+		slot.ps                      = state.programs.pixel.id;
+		slot.index_count             = draw.index_count;
+		slot.instances               = draw.instance_count;
+		slot.first_instance          = draw.first_instance;
+		slot.vertex_offset           = static_cast<int32_t>(emit.vertex_offset);
+		slot.index_type              = static_cast<uint32_t>(index_binding.type);
+		slot.index_address           = index_source.address;
+		{
+			const auto& regs = buffer.GetRegisters();
+			const auto& clip = regs.GetClipControl();
+			const auto& vp   = regs.GetScreenViewport().viewports[0];
+			const auto& dc   = regs.GetDepthControl();
+			char        text[512];
+			std::snprintf(text, sizeof(text),
+			              "dx_clip_space=%d zclip_near_disable=%d zclip_far_disable=%d "
+			              "clip_disable=%d vtx_kill_or=%d clip_err_detect_disable=%d ucp=%u "
+			              "host_depth_clip=%d viewport scale=(%g,%g,%g) offset=(%g,%g,%g) "
+			              "z=[%g,%g] z_enable=%d z_write=%d zfunc=%u",
+			              clip.dx_clip_space ? 1 : 0, clip.min_z_clip_disable ? 1 : 0,
+			              clip.max_z_clip_disable ? 1 : 0, clip.clip_disable ? 1 : 0,
+			              clip.vertex_kill_any ? 1 : 0, clip.cull_on_clipping_error_disable ? 1 : 0,
+			              static_cast<unsigned>(clip.user_clip_planes), clip.IsZClipEnabled() ? 1 : 0,
+			              vp.xscale, vp.yscale, vp.zscale, vp.xoffset, vp.yoffset, vp.zoffset, vp.zmin,
+			              vp.zmax, dc.z_enable ? 1 : 0, dc.z_write_enable ? 1 : 0,
+			              static_cast<unsigned>(dc.zfunc));
+			slot.state = text;
+			const auto& ds = rendering.depth_stencil_attachment;
+			std::snprintf(text, sizeof(text),
+			              " attachment_view=%p attachment_layout=%d attachment_clear=%d"
+			              " render_layers=%u render=%ux%u marker=%u",
+			              static_cast<void*>(static_cast<VkImageView>(ds.image_view)),
+			              static_cast<int>(ds.image_layout), ds.depth_clear ? 1 : 0,
+			              rendering.num_layers, rendering.width, rendering.height,
+			              GpuCheckpoints::GetState().next.load() & 0x3ffffu);
+			slot.state += text;
+			const auto& mode = regs.GetModeControl();
+			const auto& po   = regs.GetPolyOffset();
+			std::snprintf(text, sizeof(text),
+			              " cull_front=%d cull_back=%d face=%d poly_mode=%u bias_front=%d bias_back=%d"
+			              " bias_float_fmt=%d neg_db_bits=%d bias_clamp=%g front_scale=%g"
+			              " front_offset=%g back_scale=%g back_offset=%g stencil=%d depth_bounds=%d"
+			              " write_enable=%d compare=%d",
+			              mode.cull_front ? 1 : 0, mode.cull_back ? 1 : 0, mode.face ? 1 : 0,
+			              static_cast<unsigned>(mode.poly_mode), mode.poly_offset_front_enable ? 1 : 0,
+			              mode.poly_offset_back_enable ? 1 : 0, po.db_is_float_fmt ? 1 : 0,
+			              static_cast<int>(po.neg_num_db_bits), po.clamp, po.front_scale,
+			              po.front_offset, po.back_scale, po.back_offset,
+			              state.depth_info.stencil_test_enable ? 1 : 0,
+			              state.depth_info.depth_bounds_test_enable ? 1 : 0,
+			              state.depth_info.depth_write_enable ? 1 : 0,
+			              static_cast<int>(state.depth_info.depth_compare_op));
+			slot.state += text;
+			{
+				// Log each distinct bias configuration once, so the values are known even from
+				// runs that do not lose the device.
+				static std::vector<std::string> seen;
+				char key[256];
+				std::snprintf(key, sizeof(key),
+				              "render=%ux%u bias_front=%d bias_back=%d clamp=%g fs=%g fo=%g bs=%g bo=%g"
+				              " float=%d bits=%d cull=%d/%d",
+				              rendering.width, rendering.height, mode.poly_offset_front_enable ? 1 : 0,
+				              mode.poly_offset_back_enable ? 1 : 0, po.clamp, po.front_scale,
+				              po.front_offset, po.back_scale, po.back_offset, po.db_is_float_fmt ? 1 : 0,
+				              static_cast<int>(po.neg_num_db_bits), mode.cull_front ? 1 : 0,
+				              mode.cull_back ? 1 : 0);
+				if (seen.size() < 64 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+					seen.emplace_back(key);
+					std::printf("[trace-vs] depth state %s\n", key);
+				}
+			}
+		}
+		{
+			auto&      textures = m_context.GetTextureCache();
+			const auto describe = [&](const char* use, ImageId id, vk::ImageView view,
+			                          vk::ImageLayout layout, const ImageViewInfo* view_info) {
+				char text[512];
+				const auto* image = id ? textures.m_slot_images.try_get(id) : nullptr;
+				if (image == nullptr) {
+					std::snprintf(text, sizeof(text), "%s id=%u:%u missing", use, id.index,
+					              id.generation);
+				} else {
+					const auto& info  = image->info;
+					const auto  found = textures.m_image_ticks.find(id);
+					const auto  ticks = found != textures.m_image_ticks.end()
+					                        ? found->second
+					                        : TextureCache::ImageTicks {};
+					std::snprintf(
+					    text, sizeof(text),
+					    "%s id=%u:%u registered=%d guest=0x%" PRIx64 "+0x%" PRIx64
+					    " extent=%ux%ux%u levels=%u layers=%u vkfmt=%d guestfmt=%d tile=%d"
+					    " image=%p view=%p layout=%d view_fmt=%d view_levels=%u+%u view_layers=%u+%u"
+					    " created_tick=%" PRIu64 " init_tick=%" PRIu64 " now_tick=%" PRIu64,
+					    use, id.index, id.generation, image->registered ? 1 : 0, info.data.address,
+					    info.data.size, info.extent.width, info.extent.height, info.extent.depth,
+					    info.resources.levels, info.resources.layers,
+					    static_cast<int>(info.pixel_format), static_cast<int>(info.guest_format),
+					    static_cast<int>(info.tile_mode),
+					    static_cast<void*>(static_cast<VkImage>(image->backing.image)),
+					    static_cast<void*>(static_cast<VkImageView>(view)), static_cast<int>(layout),
+					    view_info ? static_cast<int>(view_info->format) : -1,
+					    view_info ? view_info->base_level : 0, view_info ? view_info->level_count : 0,
+					    view_info ? view_info->base_layer : 0, view_info ? view_info->layer_count : 0,
+					    ticks.created, ticks.initialized, m_context.GetCommandScheduler().CurrentTick());
+				}
+				slot.images.emplace_back(text);
+			};
+			for (const auto* stage: stages) {
+				for (const auto& texture: stage->images) {
+					describe("texture", texture.image_id, texture.image_view, texture.layout,
+					         &texture.desc.view_info);
+				}
+			}
+			describe("depth", state.depth_info.image_id, nullptr, vk::ImageLayout::eUndefined,
+			         &state.depth_info.desc.view_info);
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				describe("color", state.color_info[i].image_id, nullptr,
+				         vk::ImageLayout::eUndefined, nullptr);
+			}
+		}
+		const auto& vs = state.vertex_info[0];
+		for (int i = 0; i < vs.buffers_num; i++) {
+			slot.strides.push_back(vs.buffers[i].stride);
+			slot.num_records.push_back(vs.buffers[i].num_records);
+		}
+		for (int i = 0; i < vs.resources_num; i++) {
+			TracedDrawCapture::Attribute a;
+			std::memcpy(a.fields, vs.resources[i].fields, sizeof(a.fields));
+			a.attr_id       = vs.resources_dst[i].attr_id;
+			a.buffer_index  = vs.resources_dst[i].buffer_index;
+			a.registers_num = vs.resources_dst[i].registers_num;
+			a.fetch_index   = vs.resources_dst[i].fetch_index;
+			slot.attributes.push_back(a);
+		}
+		m_context.GetCommandScheduler().EndRendering();
+		const auto dst    = capture.storage->Handle();
+		uint64_t   cursor = 0;
+		std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
+		const auto add = [&](char kind, uint32_t index, uint64_t guest, vk::Buffer host,
+		                     uint64_t offset, uint64_t size) {
+			if (!host || size == 0 || size == VK_WHOLE_SIZE) {
+				return;
+			}
+			TracedDrawCapture::Range r;
+			r.kind        = kind;
+			r.index       = index;
+			r.guest       = guest;
+			r.size        = size;
+			r.copied      = std::min(size, TracedDrawCapture::SlotBytes - cursor);
+			r.slot_offset = cursor;
+			r.host        = static_cast<VkBuffer>(host);
+			r.host_offset = offset;
+			if (r.copied == 0) {
+				return;
+			}
+			copies.push_back({host, vk::BufferCopy {offset,
+			                                        slot_index * TracedDrawCapture::SlotBytes + cursor,
+			                                        r.copied}});
+			cursor = Common::AlignUp<uint64_t>(cursor + r.copied, 16);
+			slot.ranges.push_back(r);
+		};
+		for (const auto& info: stages.front()->buffers) {
+			const auto j = static_cast<uint32_t>(&info - stages.front()->buffers.data());
+			const auto guest = j < stages.front()->buffer_sources.size()
+			                       ? stages.front()->buffer_sources[j].address
+			                       : 0;
+			add('s', j, guest, info.buffer, info.offset, info.range);
+		}
+		if (draw.IsIndexed()) {
+			const uint64_t element = index_binding.type == vk::IndexType::eUint32 ? 4u : 2u;
+			add('i', 0, index_source.address, index_binding.buffer, index_binding.offset,
+			    uint64_t {draw.index_count} * element);
+		}
+		for (uint32_t i = 0; i < vertex_bindings.count; i++) {
+			add('v', i, i < static_cast<uint32_t>(vs.buffers_num) ? vs.buffers[i].addr : 0,
+			    vertex_bindings.buffers[i], vertex_bindings.offsets[i], vertex_bindings.sizes[i]);
+		}
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+		                          0, nullptr);
+		for (const auto& [source, region]: copies) {
+			vk_buffer.copyBuffer(source, dst, 1, &region);
+		}
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eHostRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eAllCommands |
+		                              vk::PipelineStageFlagBits::eHost,
+		                          {}, 1, &after, 0, nullptr, 0, nullptr);
+	}
+	{
+		// KYTY_GPU_HAZARD_VERIFY only (a no-op otherwise).
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t i = 0; i < vertex_bindings.count; i++) {
+			cache.VerifyBindingAlive(vertex_bindings.buffers[i], "vertex buffer", submit_id);
+		}
+		cache.VerifyBindingAlive(index_binding.buffer, "index buffer", submit_id);
+		auto& textures = m_context.GetTextureCache();
+		for (const auto* stage: stages) {
+			for (const auto& info: stage->buffers) {
+				cache.VerifyBindingAlive(info.buffer, "storage buffer", submit_id);
+			}
+			for (const auto& texture: stage->images) {
+				textures.VerifyImageAlive(texture.image_id, "texture", submit_id);
+			}
+		}
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			textures.VerifyImageAlive(state.color_info[i].image_id, "color target", submit_id);
+		}
+		textures.VerifyImageAlive(state.depth_info.image_id, "depth target", submit_id);
+	}
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1138,6 +1469,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	if (Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
+		// KYTY_DIAG_DEPTH=nowrite|nobias|always: diagnostic-only overrides of the traced draws'
+		// dynamic depth state, to test which part of the depth path the device loss depends on.
+		static const std::string experiment = [] {
+			const char* value = std::getenv("KYTY_DIAG_DEPTH");
+			return std::string(value != nullptr ? value : "");
+		}();
+		if (experiment == "nowrite") {
+			vk_buffer.setDepthWriteEnable(VK_FALSE);
+		} else if (experiment == "nobias") {
+			vk_buffer.setDepthBiasEnable(VK_FALSE);
+		} else if (experiment == "always") {
+			vk_buffer.setDepthCompareOp(vk::CompareOp::eAlways);
+		}
+	}
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
@@ -1156,7 +1502,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                 static_cast<uint32_t>(state.programs.pixel.id),
 	                                 mesh_active ? mesh_groups : 0u, draw.instance_count,
 	                                 draw.index_count});
-	if (mesh_active) {
+	static const bool diag_skip = [] {
+		const char* value = std::getenv("KYTY_DIAG_DEPTH");
+		return value != nullptr && std::strcmp(value, "skip") == 0;
+	}();
+	if (diag_skip && Common::GpuWaitDiagnostics::IsTracedProgram(state.programs.vertex[0].id)) {
+		// KYTY_DIAG_DEPTH=skip: diagnostic only, the traced draws are not emitted at all.
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);

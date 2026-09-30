@@ -638,6 +638,12 @@ void DefineModule(EmitterState& state) {
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
 	}
+	if (DiagDemotePixelKill() && state.program.stage == ShaderType::Pixel &&
+	    state.requirements.pixel_valid_mask) {
+		state.builder.RequireExtension("SPV_EXT_demote_to_helper_invocation");
+		state.builder.RequireCapability(
+		    static_cast<spv::Capability>(CapabilityDemoteToHelperInvocationValue));
+	}
 	if (state.cull_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityCullDistance);
 	}
@@ -727,6 +733,13 @@ void DefineModule(EmitterState& state) {
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		} else if (const char* diag = std::getenv("KYTY_DIAG_EARLY_Z");
+		           diag != nullptr && diag[0] == '1' && state.input_info.pixel->ps_pixel_kill_enable &&
+		           !state.input_info.pixel->ps_depth_export_enable &&
+		           !state.input_info.pixel->ps_sample_mask_export_enable) {
+			// Diagnostic only: early depth test and write for pixel-killing shaders (discarded
+			// fragments still write depth).
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}

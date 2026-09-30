@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -172,6 +173,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
+					ImageHistory::Record({m_scheduler.CurrentTick(), ImageHistory::Kind::Barrier,
+					                      backing.image, VK_NULL_HANDLE,
+					                      static_cast<int32_t>(barrier.oldLayout),
+					                      static_cast<int32_t>(barrier.newLayout), level, layer, 1,
+					                      static_cast<uint32_t>(FullAspectMask(backing.format)),
+					                      static_cast<uint64_t>(barrier.srcAccessMask),
+					                      static_cast<uint64_t>(barrier.dstAccessMask)});
 					subresource_state = {destination_stage, destination_access, destination_layout};
 				}
 			}
@@ -206,6 +214,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barrier.subresourceRange.baseArrayLayer = 0;
 		barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
 		barriers.push_back(barrier);
+		ImageHistory::Record({m_scheduler.CurrentTick(), ImageHistory::Kind::Barrier, backing.image,
+		                      VK_NULL_HANDLE, static_cast<int32_t>(barrier.oldLayout),
+		                      static_cast<int32_t>(barrier.newLayout), 0, 0, info.resources.layers,
+		                      static_cast<uint32_t>(FullAspectMask(backing.format)),
+		                      static_cast<uint64_t>(barrier.srcAccessMask),
+		                      static_cast<uint64_t>(barrier.dstAccessMask)});
 	}
 
 	state = {destination_stage, destination_access, destination_layout};

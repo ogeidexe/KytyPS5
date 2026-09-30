@@ -31,6 +31,9 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// KYTY_GPU_HAZARD_VERIFY=1 only: reports an image about to be used by the command buffer being
+	// recorded after the cache deleted it in an earlier tick (destroyed once that tick completes).
+	void VerifyImageAlive(ImageId id, const char* use, uint64_t submit_id);
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -175,6 +178,17 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	// KYTY_GPU_HAZARD_VERIFY only: deleted images whose destruction is still deferred, by tick.
+	std::map<ImageId, uint64_t> m_retired_images;
+
+public:
+	// KYTY_TRACE_VS only: tick each image was created and last initialized from guest memory.
+	struct ImageTicks {
+		uint64_t created = 0, initialized = 0;
+	};
+	std::map<ImageId, ImageTicks> m_image_ticks;
+
+private:
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;

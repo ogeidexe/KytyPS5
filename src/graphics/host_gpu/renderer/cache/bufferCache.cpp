@@ -103,13 +103,51 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 	}
 }
 
+static bool GpuHazardVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_HAZARD_VERIFY");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::VerifyBindingAlive(vk::Buffer handle, const char* use, uint64_t submit_id) {
+	if (!GpuHazardVerifyEnabled() || !handle) {
+		return;
+	}
+	const auto it = m_retired_buffers.find(static_cast<VkBuffer>(handle));
+	if (it == m_retired_buffers.end() || it->second.tick >= m_scheduler.CurrentTick()) {
+		return;
+	}
+	static uint64_t hazards = 0;
+	if (++hazards <= 200 || hazards % 1000 == 0) {
+		m_scheduler.GetMasterSemaphore().Refresh();
+		std::printf("[gpu-hazard] %s binds buffer guest=0x%" PRIx64 "+0x%" PRIx64
+		            " deleted in tick %" PRIu64 ", bound in tick %" PRIu64
+		            " (deleted tick complete=%d) submit=%" PRIu64 " count=%" PRIu64 "\n",
+		            use, it->second.guest, it->second.size, it->second.tick,
+		            m_scheduler.CurrentTick(),
+		            m_scheduler.GetMasterSemaphore().IsFree(it->second.tick) ? 1 : 0, submit_id,
+		            hazards);
+		std::fflush(stdout);
+	}
+}
+
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
+		if (GpuHazardVerifyEnabled()) {
+			const auto& buffer = m_slot_buffers[id];
+			m_retired_buffers[static_cast<VkBuffer>(buffer.Handle())] = {
+			    m_scheduler.CurrentTick(), buffer.CpuAddress(), buffer.Size()};
+		}
 		m_scheduler.DeferOperation([this, id] {
+			if (GpuHazardVerifyEnabled()) {
+				m_retired_buffers.erase(static_cast<VkBuffer>(m_slot_buffers[id].Handle()));
+			}
 			if (m_graphics.device_address_destruction_waits_for_queue) {
 				// Every command buffer submitted so far may reference this device-address buffer.
 				// ponytail: drains the queue per deletion batch; a per-buffer retire tick would

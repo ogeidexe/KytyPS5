@@ -374,6 +374,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	// The DB clamps depth to the viewport range after polygon offset is applied.
 	rasterizer.depthClampEnable = VK_TRUE;
+	if (const char* diag = std::getenv("KYTY_DIAG_NO_CLAMP"); diag != nullptr && diag[0] == '1') {
+		// Diagnostic only: plain clipping without depth clamp.
+		rasterizer.depthClampEnable = VK_FALSE;
+	}
 	rasterizer.pNext = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};

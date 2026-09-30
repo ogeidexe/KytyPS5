@@ -521,6 +521,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	graphics.attachment_feedback_loop_enabled = feedback_extensions &&
 	                                            feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	if (const char* diag = std::getenv("KYTY_DIAG_NO_FEEDBACK"); diag != nullptr && diag[0] == '1') {
+		// Diagnostic only: run without depth attachment feedback loops (no image usage flag, no
+		// dynamic state). A draw that really needs one exits with a message instead.
+		graphics.attachment_feedback_loop_enabled = false;
+	}
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -594,6 +599,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	features13.robustImageAccess = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.shaderDemoteToHelperInvocation = supported_features13.shaderDemoteToHelperInvocation;
+	LOGF("Vulkan shaderDemoteToHelperInvocation: %s\n",
+	     features13.shaderDemoteToHelperInvocation == VK_TRUE ? "true" : "false");
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",

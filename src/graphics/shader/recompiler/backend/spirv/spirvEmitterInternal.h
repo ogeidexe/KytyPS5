@@ -25,6 +25,18 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+// KYTY_DIAG_DEMOTE=1: diagnostic only, pixel kill is emitted as OpDemoteToHelperInvocation
+// (SPV_EXT_demote_to_helper_invocation) instead of OpKill.
+inline bool DiagDemotePixelKill() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DIAG_DEMOTE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+inline constexpr uint32_t OpDemoteToHelperInvocationValue         = 5380;
+inline constexpr uint32_t CapabilityDemoteToHelperInvocationValue = 5379;
+
 struct InputBinding : IR::StageInput {
 	uint32_t variable_id = 0;
 };

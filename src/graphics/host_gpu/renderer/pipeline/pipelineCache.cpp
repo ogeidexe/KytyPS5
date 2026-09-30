@@ -528,6 +528,13 @@ struct PipelineCache::ProgramCache {
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		const auto id = ++next_shader_id;
+		if (const char* traced = std::getenv("KYTY_TRACE_VS");
+		    traced != nullptr &&
+		    std::strstr(traced, fmt::format("{:016x}", options.shader_hash).c_str()) != nullptr) {
+			Common::GpuWaitDiagnostics::TracedPrograms().push_back(id);
+			std::printf("[trace-vs] %s %016" PRIx64 " is program %" PRIu64 "\n", stage_name,
+			            options.shader_hash, static_cast<uint64_t>(id));
+		}
 		// KYTY_DUMP_SHADER=<hash>[,<hash>...]: write the disassembled SPIR-V of those shaders.
 		if (const char* wanted = std::getenv("KYTY_DUMP_SHADER");
 		    wanted != nullptr &&

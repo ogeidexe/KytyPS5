@@ -106,6 +106,12 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	if (depth_stencil.has_depth) {
+		ImageHistory::Record({m_debug_submit_id, ImageHistory::Kind::BeginRendering, VK_NULL_HANDLE,
+		                      depth.imageView, 0, static_cast<int32_t>(depth.imageLayout), 0, 0,
+		                      state.num_layers, 0, 0, 0, state.width, state.height,
+		                      depth_stencil.depth_clear ? 1u : 0u});
+	}
 	m_render_state = state;
 	m_rendering    = true;
 }

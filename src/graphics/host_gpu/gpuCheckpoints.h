@@ -6,9 +6,14 @@
 // the OS reset) the driver reports the last checkpoints the GPU reached, which identifies the
 // work that hung it. Without the extension or the switch every call here is a no-op.
 
+#include "common/gpuWaitDiagnostics.h"
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +36,7 @@ struct State {
 	std::unique_ptr<Record[]>      records;
 	std::atomic<uint32_t>          next {1};
 	std::atomic<bool>              reported {false};
+	std::atomic<bool>              report_done {false};
 	PFN_vkGetDeviceFaultInfoEXT    get_fault = nullptr;
 	VkDevice                       device    = VK_NULL_HANDLE;
 };
@@ -44,6 +50,7 @@ inline State& GetState() {
 inline void Initialize(vk::Device device) {
 	auto& s          = GetState();
 	s.device         = static_cast<VkDevice>(device);
+	ImageHistory::g_marker_counter = &s.next;
 	s.get_fault      = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
 	if (s.get_fault != nullptr) {
 		std::printf("[gpu-wait] device fault reporting enabled\n");
@@ -113,9 +120,21 @@ inline void ReportDeviceFault(State& s) {
 inline void ReportDeviceLost(vk::Queue queue) {
 	auto& s = GetState();
 	if (s.reported.exchange(true)) {
+		// Another thread is reporting; let it finish before this caller exits the process.
+		for (int i = 0; i < 1000 && !s.report_done.load(); i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
 		return;
 	}
+	struct Done {
+		State& s;
+		~Done() { s.report_done = true; }
+	} done {s};
 	ReportDeviceFault(s);
+	if (auto& hook = Common::GpuWaitDiagnostics::OnDeviceLost(); hook) {
+		hook();
+	}
+	ImageHistory::Dump();
 	if (s.get_data == nullptr) {
 		return;
 	}
@@ -144,6 +163,27 @@ inline void ReportDeviceLost(vk::Queue queue) {
 			std::printf("[gpu-wait]       +%u op=%u submit=%" PRIu64
 			            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 			            k, n.op, n.submit, n.arg0, n.arg1, n.arg2, n.arg3, n.arg4);
+		}
+	}
+	// Everything recorded from the oldest marker the GPU did not retire to the newest one it began:
+	// the work that was in flight when it stopped. Top-of-pipe is stage 0x1, bottom 0x2000.
+	uint32_t top = 0, bottom = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto index = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+		if (data[i].stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) {
+			top = index;
+		} else if (data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) {
+			bottom = index;
+		}
+	}
+	if (top != 0 && bottom != 0) {
+		const auto span = ((top - bottom) & (State::Size - 1u)) + 4u;
+		std::printf("[gpu-wait] in flight (%u records from bottom marker %u):\n", span, bottom);
+		for (uint32_t k = 0; k <= std::min(span, 128u); k++) {
+			const auto  index = (bottom + k) & (State::Size - 1u);
+			const auto& n     = s.records[index];
+			std::printf("[gpu-wait]   %u op=%u submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+			            index, n.op, n.submit, n.arg0, n.arg1, n.arg2, n.arg3, n.arg4);
 		}
 	}
 	std::fflush(stdout);

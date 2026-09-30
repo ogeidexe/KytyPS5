@@ -21,7 +21,12 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, inactive, kill_label, merge_label);
 	EmitLabel(state, kill_label);
-	state.builder.AddFunction(spv::OpKill);
+	if (DiagDemotePixelKill()) {
+		state.builder.AddFunction(static_cast<spv::Op>(OpDemoteToHelperInvocationValue));
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+	} else {
+		state.builder.AddFunction(spv::OpKill);
+	}
 	EmitLabel(state, merge_label);
 }
 

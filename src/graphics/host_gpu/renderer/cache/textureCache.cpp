@@ -223,9 +223,14 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+static bool TraceImageTicks();
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	Common::FrameStats::g_image_creates.fetch_add(1, std::memory_order_relaxed);
+	if (TraceImageTicks() && m_scheduler.Active()) {
+		m_image_ticks[id] = {m_scheduler.CurrentTick(), 0};
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -274,6 +279,41 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 }
 
+static bool TraceImageTicks() {
+	static const bool enabled = std::getenv("KYTY_TRACE_VS") != nullptr;
+	return enabled;
+}
+
+static bool GpuHazardVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_HAZARD_VERIFY");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void TextureCache::VerifyImageAlive(ImageId id, const char* use, uint64_t submit_id) {
+	if (!GpuHazardVerifyEnabled() || !id) {
+		return;
+	}
+	const auto it = m_retired_images.find(id);
+	if (it == m_retired_images.end() || it->second >= m_scheduler.CurrentTick()) {
+		return;
+	}
+	static uint64_t hazards = 0;
+	if (++hazards <= 200 || hazards % 1000 == 0) {
+		const auto& image = m_slot_images[id];
+		std::printf("[gpu-hazard] %s uses image guest=0x%" PRIx64 "+0x%" PRIx64 " %ux%ux%u fmt=%d"
+		            " deleted in tick %" PRIu64 ", used in tick %" PRIu64 " submit=%" PRIu64
+		            " count=%" PRIu64 "\n",
+		            use, image.info.data.address, image.info.data.size, image.info.extent.width,
+		            image.info.extent.height, image.info.extent.depth,
+		            static_cast<int>(image.info.pixel_format), it->second, m_scheduler.CurrentTick(),
+		            submit_id, hazards);
+		std::fflush(stdout);
+	}
+}
+
 void TextureCache::DeleteImage(ImageId id) {
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
@@ -306,7 +346,14 @@ void TextureCache::DeleteImage(ImageId id) {
 	UnregisterImage(id);
 	Common::FrameStats::g_image_deletes.fetch_add(1, std::memory_order_relaxed);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		if (GpuHazardVerifyEnabled()) {
+			m_retired_images[id] = m_scheduler.CurrentTick();
+		}
+		m_scheduler.DeferOperation([this, id] {
+			m_retired_images.erase(id);
+			m_image_ticks.erase(id);
+			m_slot_images.erase(id);
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -1104,6 +1151,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 }
 
 void TextureCache::InitializeImage(ImageId id) {
+	if (TraceImageTicks() && m_scheduler.Active()) {
+		m_image_ticks[id].initialized = m_scheduler.CurrentTick();
+	}
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;

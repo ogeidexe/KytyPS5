@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,6 +88,10 @@ public:
 	// overlaps them. Otherwise returns false and reads nothing. GPU thread only. Unlike a direct
 	// load this never faults, so bytes sharing a page with GPU-written data read without a drain.
 	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, void* data, uint64_t size);
+	// KYTY_GPU_HAZARD_VERIFY=1 only: reports a buffer handle about to be bound by the command
+	// buffer being recorded after the cache deleted it in an earlier tick. Such a buffer is freed
+	// once that earlier tick completes, possibly before this command buffer executes.
+	void VerifyBindingAlive(vk::Buffer handle, const char* use, uint64_t submit_id);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// True when [vaddr, vaddr + size) was last written, on the GPU, by one fill with *value.
@@ -178,6 +183,11 @@ private:
 	// Bytes an in-flight eager write-back took out of the GPU-modified ranges and has not yet
 	// written to guest memory. Cleared per page when the page's write-back retires.
 	RangeSet m_eager_pending_ranges;
+	struct RetiredBuffer {
+		uint64_t tick = 0, guest = 0, size = 0;
+	};
+	// KYTY_GPU_HAZARD_VERIFY only: deleted buffers whose destruction is still deferred.
+	std::unordered_map<VkBuffer, RetiredBuffer> m_retired_buffers;
 	void RetireHotPages(uint64_t vaddr, uint64_t size, bool wait);
 	bool VerifyWrittenBack(uint64_t page);
 	bool EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);

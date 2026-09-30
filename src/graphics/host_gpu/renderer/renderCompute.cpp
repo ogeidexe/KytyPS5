@@ -385,6 +385,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
+	for (const auto& info: bindings.buffers) {
+		m_context.GetBufferCache().VerifyBindingAlive(info.buffer, "compute storage buffer",
+		                                              submit_id);
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
@@ -449,6 +453,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	PreparedBindings* descriptor_stage = &bindings;
+	for (const auto& info: bindings.buffers) {
+		m_context.GetBufferCache().VerifyBindingAlive(info.buffer, "compute storage buffer",
+		                                              submit_id);
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
