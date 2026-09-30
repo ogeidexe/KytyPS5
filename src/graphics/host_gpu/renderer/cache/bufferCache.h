@@ -82,6 +82,11 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Copies [vaddr, vaddr + size) from guest memory when guest memory is authoritative for exactly
+	// those bytes: none is GPU-modified or awaiting an eager write-back, and no GPU-modified image
+	// overlaps them. Otherwise returns false and reads nothing. GPU thread only. Unlike a direct
+	// load this never faults, so bytes sharing a page with GPU-written data read without a drain.
+	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// True when [vaddr, vaddr + size) was last written, on the GPU, by one fill with *value.
@@ -167,6 +172,9 @@ private:
 	uint64_t          m_readback_tick      = 0;
 	// Hot page (4 KiB aligned) -> tick of its in-flight eager write-back, 0 when none.
 	std::map<uint64_t, uint64_t> m_hot_pages;
+	// Bytes an in-flight eager write-back took out of the GPU-modified ranges and has not yet
+	// written to guest memory. Cleared per page when the page's write-back retires.
+	RangeSet m_eager_pending_ranges;
 	void RetireHotPages(uint64_t vaddr, uint64_t size, bool wait);
 	bool VerifyWrittenBack(uint64_t page);
 	bool EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);

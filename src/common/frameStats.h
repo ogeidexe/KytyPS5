@@ -72,6 +72,14 @@ inline std::atomic<uint32_t> g_image_deletes {0};
 // Diagnostic: wall time spent detiling and uploading new texture data (TextureCache::UploadImage),
 // to tell a burst of new-texture stalls apart from shader compiles when both spike together.
 inline std::atomic<uint64_t> g_image_upload_us {0};
+// Vertex attribute/buffer tables read per draw: copied without faulting because guest memory was
+// provably current for their bytes, or loaded directly (which faults on a GPU-modified page).
+inline std::atomic<uint32_t> g_vertex_tables_clean {0};
+inline std::atomic<uint32_t> g_vertex_tables_direct {0};
+// Other shader metadata reads from guest memory (ShaderReadGuest): same split.
+inline std::atomic<uint32_t> g_guest_reads_clean {0};
+inline std::atomic<uint32_t> g_guest_reads_direct {0};
+inline std::atomic<uint32_t> g_clean_read_mismatches {0}; // KYTY_CLEAN_READ_VERIFY=1 only
 // Diagnostic: guest-CPU write-protection faults (RenderContext::HandleFault), to tell a burst of
 // them apart from shader compiles and texture uploads when several spike on the same frame.
 inline std::atomic<uint32_t> g_fault_count {0};

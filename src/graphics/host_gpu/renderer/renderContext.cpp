@@ -5,9 +5,15 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shader.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -18,9 +24,32 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	ShaderSetCleanGuestReader(
+	    [](void* cache, uint64_t vaddr, void* data, uint64_t size) {
+		    // The buffer cache belongs to the GPU thread; other callers take the plain load.
+		    if (!GuestGpu::IsGpuThread() ||
+		        !static_cast<BufferCache*>(cache)->TryReadCleanBytes(vaddr, data, size)) {
+			    return false;
+		    }
+		    // KYTY_CLEAN_READ_VERIFY=1: compare with the authoritative (faulting) load.
+		    static const bool verify = std::getenv("KYTY_CLEAN_READ_VERIFY") != nullptr;
+		    if (verify) {
+			    std::vector<uint8_t> reference(size);
+			    std::memcpy(reference.data(), reinterpret_cast<const void*>(vaddr), size);
+			    if (std::memcmp(reference.data(), data, size) != 0) {
+				    Common::FrameStats::g_clean_read_mismatches.fetch_add(
+				        1, std::memory_order_relaxed);
+				    std::printf("CLEAN READ MISMATCH addr=0x%016" PRIx64 " size=%" PRIu64 "\n",
+				                vaddr, size);
+			    }
+		    }
+		    return true;
+	    },
+	    &m_buffer_cache);
 }
 
 RenderContext::~RenderContext() {
+	ShaderSetCleanGuestReader(nullptr, nullptr);
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

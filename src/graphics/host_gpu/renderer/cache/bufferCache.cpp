@@ -585,6 +585,9 @@ bool BufferCache::EagerDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	EXIT_IF(total > needed);
+	for (const auto& copy: copies) {
+		m_eager_pending_ranges.Add(buffer.CpuAddress() + copy.srcOffset, copy.size);
+	}
 	m_download_buffer.Commit();
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
@@ -646,6 +649,7 @@ void BufferCache::RetireHotPages(uint64_t vaddr, uint64_t size, bool wait) {
 			m_scheduler.WaitPriorityOperations(inflight);
 		}
 		inflight = 0;
+		m_eager_pending_ranges.Subtract(page, TRACKER_PAGE_SIZE); // written to guest memory
 		// A newer GPU write landed after the copy was recorded: stay protected; its bytes are
 		// written back by a later pass or read back on demand.
 		if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
@@ -1056,6 +1060,22 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::TryReadCleanBytes(uint64_t vaddr, void* data, uint64_t size) {
+	if (size == 0 || size > UINT64_MAX - vaddr || m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		return false;
+	}
+	// An eager write-back takes its bytes out of the GPU-modified ranges when it is recorded and
+	// writes them to guest memory only when it retires; until then exactly those bytes are stale.
+	// Other bytes on the page are not touched by it.
+	if (m_eager_pending_ranges.Intersects(vaddr, size)) {
+		return false;
+	}
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	return Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

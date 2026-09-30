@@ -1,6 +1,7 @@
 #include "graphics/shader/shader.h"
 
 #include "common/assert.h"
+#include "common/frameStats.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -18,6 +19,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -489,6 +491,35 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+// Copies the attribute and buffer tables a vertex shader's inputs use into attrib_words and
+// buffer_words when the renderer can prove guest memory holds their current bytes. A direct load
+// of the tables faults, and waits for the GPU, whenever GPU-written data shares their page, which
+// PPSA21567 hit on most draws.
+static bool ShaderReadVertexTablesClean(std::span<const ShaderSemantic> semantics,
+                                        const uint32_t* attrib, const uint32_t* buffer,
+                                        std::array<uint32_t, 64>& attrib_words,
+                                        std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4>& buffer_words) {
+	if (semantics.empty()) {
+		return false;
+	}
+	uint32_t max_semantic = 0;
+	for (const auto& in: semantics) {
+		max_semantic = std::max<uint32_t>(max_semantic, in.semantic);
+	}
+	if (max_semantic >= attrib_words.size() ||
+	    !ShaderTryReadGuestClean(attrib_words.data(), attrib,
+	                             (max_semantic + 1u) * sizeof(uint32_t))) {
+		return false;
+	}
+	uint32_t max_index = 0;
+	for (const auto& in: semantics) {
+		max_index = std::max<uint32_t>(max_index, attrib_words[in.semantic] & 0x1fu);
+	}
+	return max_index < ShaderVertexInputInfo::RES_MAX &&
+	       ShaderTryReadGuestClean(buffer_words.data(), buffer,
+	                               (max_index + 1u) * 4u * sizeof(uint32_t));
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
@@ -533,7 +564,23 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
+		// The semantics live in the shader header in guest memory; copy them once per draw.
+		std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> semantic_copy {};
+		EXIT_IF(metadata.input_semantics.size() > semantic_copy.size());
+		ShaderReadGuest(semantic_copy.data(), metadata.input_semantics.data(),
+		                metadata.input_semantics.size_bytes());
+		const std::span<const ShaderSemantic> semantics(semantic_copy.data(),
+		                                                metadata.input_semantics.size());
+		std::array<uint32_t, 64>                                 attrib_words {};
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> buffer_words {};
+		if (ShaderReadVertexTablesClean(semantics, attrib, buffer, attrib_words, buffer_words)) {
+			attrib = attrib_words.data();
+			buffer = buffer_words.data();
+			Common::FrameStats::g_vertex_tables_clean.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			Common::FrameStats::g_vertex_tables_direct.fetch_add(1, std::memory_order_relaxed);
+		}
+		ShaderApplyAttribSemantics(info, semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}
 	return true;

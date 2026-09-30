@@ -303,6 +303,16 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// Installed by the renderer: copies guest bytes only when guest memory is authoritative for them
+// (BufferCache::TryReadCleanBytes), returning false otherwise. Used for the vertex tables read on
+// every draw, which often share a page with GPU-written data. GPU thread only.
+using ShaderCleanGuestReader = bool (*)(void* context, uint64_t vaddr, void* data, uint64_t size);
+void ShaderSetCleanGuestReader(ShaderCleanGuestReader reader, void* context);
+// memcpy from guest memory that, on the GPU thread, avoids faulting on a page shared with
+// GPU-written data when the renderer proves these bytes current. Same result as memcpy.
+void ShaderReadGuest(void* dst, const void* src, size_t size);
+// The clean path alone: false (and nothing read) when the bytes cannot be proven current.
+bool ShaderTryReadGuestClean(void* dst, const void* src, size_t size);
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

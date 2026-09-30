@@ -1001,6 +1001,13 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_flip_pending_max.exchange(0),
 			            Common::FrameStats::g_readback_count.exchange(0),
 			            Common::FrameStats::g_readback_wait_us.exchange(0) / 1000.0);
+			std::printf("[frame-stats]   vtx_tables_clean=%u vtx_tables_direct=%u"
+			            " guest_reads_clean=%u guest_reads_direct=%u clean_read_mismatches=%u\n",
+			            Common::FrameStats::g_vertex_tables_clean.exchange(0),
+			            Common::FrameStats::g_vertex_tables_direct.exchange(0),
+			            Common::FrameStats::g_guest_reads_clean.exchange(0),
+			            Common::FrameStats::g_guest_reads_direct.exchange(0),
+			            Common::FrameStats::g_clean_read_mismatches.exchange(0));
 			std::printf("[frame-stats]   readback_kb=%.1f indirect=%u gpu_written=%u zero=%u"
 			            " speculated=%u indirect_stall=%.1fms\n",
 			            Common::FrameStats::g_readback_bytes.exchange(0) / 1024.0,
