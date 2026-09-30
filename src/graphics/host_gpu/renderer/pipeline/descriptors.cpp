@@ -371,6 +371,13 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	if (resource.depth_compare && binding == TextureCache::BindingType::Texture &&
+	    resource.numeric_class == Prospero::TextureNumericClass::Float) {
+		// A comparison sampler needs a view whose format supports depth comparison.
+		desc.info.pixel_format = vk::Format::eD32Sfloat;
+		desc.view_info.format  = vk::Format::eD32Sfloat;
+		desc.view_info.aspect  = vk::ImageAspectFlagBits::eDepth;
+	}
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
