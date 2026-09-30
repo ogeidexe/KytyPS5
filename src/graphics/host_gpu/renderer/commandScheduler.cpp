@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 
+#include "common/gpuWaitDiagnostics.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -386,8 +388,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Common::GpuWaitDiagnostics::Note("submit", reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_master.Handle())),
+	                                 tick, submit.num_wait_semaphores, static_cast<uint64_t>(result));
 
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuCheckpoints::ReportDeviceLost(graphics.queue);
+		}
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,

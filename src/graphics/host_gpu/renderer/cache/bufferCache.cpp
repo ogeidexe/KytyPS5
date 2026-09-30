@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/cache/bufferDownloadBatch.h"
 
+#include "common/gpuWaitDiagnostics.h"
 #include "common/alignment.h"
 #include "common/frameStats.h"
 #include "common/assert.h"
@@ -229,6 +231,7 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		EXIT_IF(command.end() != vk::Result::eSuccess);
 
 		const uint64_t                  signal_value = ++m_readback_tick;
+		Common::GpuWaitDiagnostics::Note("readback-submit", signal_value, batch.total_size);
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.signalSemaphoreValueCount = 1;
 		timeline_info.pSignalSemaphoreValues    = &signal_value;
@@ -242,21 +245,25 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			Common::LockGuard lock(m_graphics.queue_mutex);
 			const auto        result = m_graphics.queue.submit(1, &submit_info, nullptr);
 			if (result != vk::Result::eSuccess) {
+				if (result == vk::Result::eErrorDeviceLost) {
+					GpuCheckpoints::ReportDeviceLost(m_graphics.queue);
+				}
 				EXIT("BufferCache: readback submit failed: %s\n", vk::to_string(result).c_str());
 			}
 		}
-		vk::SemaphoreWaitInfo wait_info {};
-		wait_info.semaphoreCount = 1;
-		wait_info.pSemaphores    = &m_readback_semaphore;
-		wait_info.pValues        = &signal_value;
-		const auto wait_start    = Common::Timer::QueryPerformanceCounter();
-		const auto wait_result   = device.waitSemaphores(&wait_info, UINT64_MAX);
+		const auto wait_start = Common::Timer::QueryPerformanceCounter();
+		// Reports a lost device instead of waiting forever (see WaitTimeline).
+		WaitTimeline(m_graphics, m_readback_semaphore, signal_value, "a buffer readback");
+		const auto wait_result = vk::Result::eSuccess;
 		Common::FrameStats::g_readback_count.fetch_add(1, std::memory_order_relaxed);
 		Common::FrameStats::g_readback_wait_us.fetch_add(
 		    (Common::Timer::QueryPerformanceCounter() - wait_start) * 1000000 /
 		        Common::Timer::QueryPerformanceFrequency(),
 		    std::memory_order_relaxed);
 		if (wait_result != vk::Result::eSuccess) {
+			if (wait_result == vk::Result::eErrorDeviceLost) {
+				GpuCheckpoints::ReportDeviceLost(m_graphics.queue);
+			}
 			EXIT("BufferCache: readback wait failed: %s\n", vk::to_string(wait_result).c_str());
 		}
 

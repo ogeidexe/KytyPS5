@@ -1,3 +1,4 @@
+#include "common/gpuWaitDiagnostics.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -536,6 +537,7 @@ void Swapchain::Destroy() {
 }
 
 void Swapchain::Recreate(bool surface_lost) {
+	Common::GpuWaitDiagnostics::Note("swapchain-recreate", surface_lost ? 1 : 0, m_frame_index);
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -563,6 +565,8 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
+	Common::GpuWaitDiagnostics::Note("acquire", m_frame_index, static_cast<uint64_t>(static_cast<int64_t>(result)),
+	                                 m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -828,7 +832,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick = scheduler.Submit(submit);
+	Common::GpuWaitDiagnostics::Note("present-submit", m_frame_index, m_image_index, tick);
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -847,6 +853,8 @@ Swapchain::Status Swapchain::Present() {
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
+	Common::GpuWaitDiagnostics::Note("present", m_frame_index, m_image_index,
+	                                 static_cast<uint64_t>(static_cast<int64_t>(result)));
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:

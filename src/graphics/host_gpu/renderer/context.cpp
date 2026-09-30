@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -58,6 +59,7 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	GpuCheckpoints::Mark(Handle(), {op, submit_id, arg0, arg1, arg2, arg3, arg4});
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "common/gpuWaitDiagnostics.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1052,6 +1054,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
 		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
 		        limits.maxMeshWorkGroupTotalCount) {
+			if (Common::GpuWaitDiagnostics::Enabled()) {
+				char header[160];
+				std::snprintf(header, sizeof(header),
+				              "mesh limit: groups=%u instances=%u index_count=%u indexed=%d "
+				              "first_instance=%u",
+				              mesh_groups, draw.instance_count, draw.index_count,
+				              draw.IsIndexed() ? 1 : 0, draw.first_instance);
+				Common::GpuWaitDiagnostics::Dump(header);
+			}
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1140,6 +1151,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	// Diagnostics only (no-op otherwise): the draw about to be emitted, with its programs.
+	GpuCheckpoints::Mark(vk_buffer, {0xD0u, submit_id, static_cast<uint32_t>(state.programs.vertex[0].id),
+	                                 static_cast<uint32_t>(state.programs.pixel.id),
+	                                 mesh_active ? mesh_groups : 0u, draw.instance_count,
+	                                 draw.index_count});
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {

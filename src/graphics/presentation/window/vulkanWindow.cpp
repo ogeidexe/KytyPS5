@@ -6,6 +6,8 @@
 #include <mutex>
 
 #include "common/assert.h"
+#include "common/gpuWaitDiagnostics.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -611,6 +613,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext                                          = &provoking_vertex;
 	}
+	// Diagnostics only: lets a device loss report the faulting GPU address (see GpuCheckpoints).
+	VkPhysicalDeviceFaultFeaturesEXT fault_features {};
+	fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+	if (std::any_of(device_extensions.begin(), device_extensions.end(), [](const char* name) {
+		    return std::strcmp(name, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0;
+	    })) {
+		fault_features.deviceFault = VK_TRUE;
+		fault_features.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &fault_features;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1003,6 +1015,14 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (Common::GpuWaitDiagnostics::Enabled() &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		}
+		if (Common::GpuWaitDiagnostics::Enabled() &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions,
 		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions,
@@ -1020,6 +1040,9 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (Common::GpuWaitDiagnostics::Enabled()) {
+		GpuCheckpoints::Initialize(graphic_ctx.device);
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 

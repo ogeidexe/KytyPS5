@@ -38,6 +38,11 @@ private:
 	std::atomic<uint64_t> m_current_tick {1};
 };
 
+// Waits until a timeline semaphore reaches value. A lost device is reported as a fatal error
+// instead of waiting forever. next_unsubmitted is only used in diagnostics output.
+void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t value,
+                  const char* what, uint64_t next_unsubmitted = 0);
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_

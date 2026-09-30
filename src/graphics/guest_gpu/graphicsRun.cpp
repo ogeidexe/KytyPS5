@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/gpuWaitDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -939,6 +940,7 @@ void CommandProcessor::SetDispatchIndirectArgsBaseAddress(
 }
 
 void CommandProcessor::SetNumInstances(uint32_t num_instances) {
+	Common::GpuWaitDiagnostics::Note("num-instances", num_instances);
 	if (num_instances == 0) {
 		num_instances = 1;
 	}
@@ -1043,6 +1045,8 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 			    ++it->second.uses < interval) {
 				std::memcpy(dst, it->second.words.data(), size);
 				Common::FrameStats::g_indirect_speculated.fetch_add(1, std::memory_order_relaxed);
+				Common::GpuWaitDiagnostics::Note("indirect-spec", address, it->second.words[0],
+				                                 it->second.words[1], size);
 				return;
 			}
 		}
@@ -1056,6 +1060,12 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 		    (Common::Timer::QueryPerformanceCounter() - start) * 1000000 /
 		        Common::Timer::QueryPerformanceFrequency(),
 		    std::memory_order_relaxed);
+	}
+	if (Common::GpuWaitDiagnostics::Enabled()) {
+		uint32_t words[2] {};
+		std::memcpy(words, dst, std::min<uint32_t>(size, sizeof(words)));
+		Common::GpuWaitDiagnostics::Note(gpu_written ? "indirect-read-gpu" : "indirect-read-cpu",
+		                                 address, words[0], words[1], size);
 	}
 	if (interval != 0) {
 		auto&      entry = speculation[address];
@@ -1162,6 +1172,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
+		Common::GpuWaitDiagnostics::Note("indirect-multi", args_addr, i, draw_count, indexed);
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			m_num_instances = args->instance_count;

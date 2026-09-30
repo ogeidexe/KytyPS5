@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "common/frameStats.h"
+#include "common/gpuWaitDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -526,10 +527,34 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		const auto id = ++next_shader_id;
+		// KYTY_DUMP_SHADER=<hash>[,<hash>...]: write the disassembled SPIR-V of those shaders.
+		if (const char* wanted = std::getenv("KYTY_DUMP_SHADER");
+		    wanted != nullptr &&
+		    std::strstr(wanted, fmt::format("{:016x}", options.shader_hash).c_str()) != nullptr) {
+			spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+			std::string          text;
+			if (tools.Disassemble(result.spirv, &text,
+			                      SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES |
+			                          SPV_BINARY_TO_TEXT_OPTION_INDENT)) {
+				const auto name =
+				    fmt::format("shader_dump_{}_{:016x}.spvasm", stage_name, options.shader_hash);
+				if (FILE* f = std::fopen(name.c_str(), "w")) {
+					std::fwrite(text.data(), 1, text.size(), f);
+					std::fclose(f);
+					std::printf("[gpu-wait] dumped %s\n", name.c_str());
+				}
+			}
+		}
+		if (Common::GpuWaitDiagnostics::Enabled()) {
+			std::printf("[gpu-wait] program %llu = %s hash=0x%016llx\n",
+			            static_cast<unsigned long long>(id), stage_name,
+			            static_cast<unsigned long long>(options.shader_hash));
+		}
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = id, .module = module},
 		};
 	}
 
