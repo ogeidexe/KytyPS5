@@ -1036,6 +1036,9 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_dep_mismatches.exchange(0),
 			            Common::FrameStats::g_eager_skipped.exchange(0));
 			std::fflush(stdout);
+			if (frame_times != nullptr) {
+				std::fflush(frame_times); // a killed process must not lose the last seconds
+			}
 			stats_start  = now;
 			worst_ms     = 0.0;
 			over_33ms    = 0;
