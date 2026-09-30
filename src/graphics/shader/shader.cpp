@@ -635,6 +635,23 @@ static void ShaderGetStaticInputInfoPS(
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
+	// KYTY_LOG_PS_INPUTS=1 (diagnostic): each distinct SPI_PS_INPUT_CNTL set once, with the export
+	// count of SPI_VS_OUT_CONFIG and the pixel program, to check how inputs map to parameters.
+	static const bool log_inputs = std::getenv("KYTY_LOG_PS_INPUTS") != nullptr;
+	if (log_inputs) {
+		static std::mutex                   mutex;
+		static std::unordered_map<std::string, bool> seen;
+		std::string key = fmt::format("ps@{:010x} n={} vs_out_config=0x{:08x} export_count={}",
+		                              regs.ps_regs.data_addr, ps_info.input_num, sh.m_spiVsOutConfig,
+		                              sh.GetExportCount());
+		for (uint32_t i = 0; i < ps_info.input_num; i++) {
+			key += fmt::format(" {:08x}", ps_info.interpolator_settings[i]);
+		}
+		std::lock_guard lock(mutex);
+		if (seen.emplace(key, true).second) {
+			std::printf("[ps-inputs] %s\n", key.c_str());
+		}
+	}
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
