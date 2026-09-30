@@ -141,6 +141,28 @@ ImagePoolKey MakeImagePoolKey(const vk::ImageCreateInfo& info) {
 
 } // namespace
 
+// KYTY_BDA_CAPTURE_REPLAY: memory VMA allocates for device-address use also gets the capture-replay
+// flag, which a buffer created with the capture-replay flag must be bound to. The flags struct is
+// VMA's own local, so updating it in place is allowed.
+static PFN_vkAllocateMemory g_allocate_memory = nullptr;
+
+static VkResult VKAPI_CALL AllocateMemoryCaptureReplay(VkDevice device,
+                                                       const VkMemoryAllocateInfo* info,
+                                                       const VkAllocationCallbacks* callbacks,
+                                                       VkDeviceMemory* memory) {
+	for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr;
+	     next = next->pNext) {
+		if (next->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) {
+			auto* flags = const_cast<VkMemoryAllocateFlagsInfo*>(
+			    reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(next));
+			if ((flags->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) != 0) {
+				flags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+			}
+		}
+	}
+	return g_allocate_memory(device, info, callbacks, memory);
+}
+
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(instance == nullptr || physical_device == nullptr || device == nullptr ||
@@ -149,6 +171,10 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	if (bda_capture_replay) {
+		g_allocate_memory          = VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory;
+		functions.vkAllocateMemory = AllocateMemoryCaptureReplay;
+	}
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;

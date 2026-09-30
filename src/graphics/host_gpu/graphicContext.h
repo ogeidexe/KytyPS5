@@ -30,6 +30,8 @@ struct GraphicContext {
 	bool                                      compute_subgroup_size_control_enabled      = false;
 	bool                                      sample_rate_shading_enabled                = false;
 	bool                                      attachment_feedback_loop_enabled           = false;
+	// KYTY_BDA_CAPTURE_REPLAY (diagnostics): device-address buffers are created replayable.
+	bool                                      bda_capture_replay                         = false;
 	bool                                      provoking_vertex_last_enabled              = false;
 	bool                                      supports_block_texel_view                  = false;
 	bool                                      mesh_shader_enabled                        = false;

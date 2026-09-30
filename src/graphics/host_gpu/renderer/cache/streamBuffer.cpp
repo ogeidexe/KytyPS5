@@ -67,6 +67,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	if (with_bda && graphics.bda_capture_replay) {
+		buffer_info.flags |= vk::BufferCreateFlagBits::eDeviceAddressCaptureReplay;
+	}
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};

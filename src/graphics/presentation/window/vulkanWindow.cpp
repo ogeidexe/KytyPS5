@@ -472,6 +472,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	if (std::getenv("KYTY_BDA_CAPTURE_REPLAY") != nullptr) {
+		// Diagnostics only: buffer device addresses a capture/replay tool (GFXReconstruct) can
+		// reproduce. Device-address buffers and their memory get the capture-replay flags.
+		features12.bufferDeviceAddressCaptureReplay =
+		    supported_features12.bufferDeviceAddressCaptureReplay;
+		graphics.bda_capture_replay = features12.bufferDeviceAddressCaptureReplay == VK_TRUE;
+		LOGF("Vulkan bufferDeviceAddressCaptureReplay: %s\n",
+		     graphics.bda_capture_replay ? "true" : "false");
+	}
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
