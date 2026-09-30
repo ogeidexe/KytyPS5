@@ -399,12 +399,6 @@ void DefineInputs(EmitterState& state) {
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&
 		    input.kind == IR::StageInputKind::Parameter) {
-			if (ShaderPixelParameterUsesDefault(*state.input_info.pixel, input.location)) {
-				// SPI_PS_INPUT_CNTL.DEFAULT_VAL: no vertex output feeds this input, so it is a
-				// constant (EmitAttribute), not an interface variable.
-				input.variable_id = 0;
-				continue;
-			}
 			const auto location = PixelParameterLocation(state, input.location);
 			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
 				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&

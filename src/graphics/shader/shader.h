@@ -142,10 +142,6 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
-	// Location + 1 of a second Vulkan output for parameter i (0 = none). A pixel shader that reads
-	// one vertex parameter both flat and smooth needs two input locations; the paired vertex stage
-	// writes the parameter to both.
-	uint8_t                 param_extra_location_plus1[32] = {};
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -162,8 +158,6 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
-	// SPI_VS_OUT_CONFIG.VS_EXPORT_COUNT + 1: parameters the preceding stage exports.
-	uint32_t                                       vs_export_count              = 32;
 	uint32_t                                       wave_size                    = 64;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
@@ -212,13 +206,6 @@ uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, ui
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
-// SPI_PS_INPUT_CNTL: the input reads DEFAULT_VAL instead of a vertex parameter, either because
-// OFFSET bit 5 selects the default or because it names a parameter the preceding stage does not
-// export.
-bool     ShaderPixelParameterUsesDefault(const ShaderPixelInputInfo& info, uint32_t input);
-// The DEFAULT_VAL component as float bits: (0,0,0,0), (0,0,0,1), (1,1,1,0) or (1,1,1,1).
-uint32_t ShaderPixelParameterDefaultBits(const ShaderPixelInputInfo& info, uint32_t input,
-                                         uint32_t component);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
 
 struct ShaderSharp {

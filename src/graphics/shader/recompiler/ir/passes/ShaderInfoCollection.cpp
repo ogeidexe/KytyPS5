@@ -383,20 +383,8 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					}
 					break;
 				case ExportTargetKind::Parameter:
-					if (!HasOutput(info, StageOutputKind::Parameter, export_info.index)) {
-						AddOutput(info, StageOutputKind::Parameter, export_info.index,
-						          export_info.index, fmt::format("out_param_{}", export_info.index));
-						// The paired pixel stage reads this parameter at a second location too.
-						const auto extra =
-						    export_info.index < 32u && input_info.vertex != nullptr
-						        ? input_info.vertex->param_extra_location_plus1[export_info.index]
-						        : 0u;
-						if (extra != 0u) {
-							info.outputs.push_back({StageOutputKind::Parameter, export_info.index,
-							                        extra - 1u,
-							                        fmt::format("out_param_{}_alt", export_info.index)});
-						}
-					}
+					AddOutput(info, StageOutputKind::Parameter, export_info.index,
+					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
 				case ExportTargetKind::Mrt:
 					if (alpha_remap && export_info.index != 0) {

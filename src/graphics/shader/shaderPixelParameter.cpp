@@ -53,29 +53,6 @@ bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input
 	       !ShaderPixelParameterIsCustom(info, input);
 }
 
-bool ShaderPixelParameterUsesDefault(const ShaderPixelInputInfo& info, uint32_t input) {
-	if (input >= info.input_num) {
-		return false;
-	}
-	constexpr uint32_t PsInputUseDefault = 0x00000020u;
-	const auto         settings          = info.interpolator_settings[input];
-	return (settings & PsInputUseDefault) != 0 ||
-	       (settings & PsInputOffsetMask) >= info.vs_export_count;
-}
-
-uint32_t ShaderPixelParameterDefaultBits(const ShaderPixelInputInfo& info, uint32_t input,
-                                         uint32_t component) {
-	constexpr uint32_t One = 0x3f800000u;
-	const auto default_val = input < info.input_num ? (info.interpolator_settings[input] >> 8u) & 3u
-	                                                : 0u;
-	switch (default_val) {
-		case 1: return component == 3 ? One : 0u;
-		case 2: return component == 3 ? 0u : One;
-		case 3: return One;
-		default: return 0u;
-	}
-}
-
 bool ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
 }
