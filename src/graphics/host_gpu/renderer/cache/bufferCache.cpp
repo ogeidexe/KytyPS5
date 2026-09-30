@@ -470,18 +470,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (buffer.last_gpu_write_tick >= m_scheduler.CurrentTick()) {
 				Common::FrameStats::g_cpu_read_flushes.fetch_add(1, std::memory_order_relaxed);
 			}
-			static uint32_t dumped = 0;
-			if (dumped < 4 && (vaddr >> 12) == (0x555f41dd0ull >> 12)) {
-				dumped++;
-				std::printf("[dep-trace] read=0x%llx buffer=[0x%llx,+0x%llx) writer_tick=%llu "
-				            "current_tick=%llu gpu_done_tick=%llu gpu_modified_in_window=%d\n",
-				            (unsigned long long)vaddr, (unsigned long long)buffer.CpuAddress(),
-				            (unsigned long long)buffer.Size(),
-				            (unsigned long long)buffer.last_gpu_write_tick,
-				            (unsigned long long)m_scheduler.CurrentTick(),
-				            (unsigned long long)m_scheduler.GetMasterSemaphore().KnownGpuTick(),
-				            IsRegionGpuModified(vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0);
-			}
 		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
