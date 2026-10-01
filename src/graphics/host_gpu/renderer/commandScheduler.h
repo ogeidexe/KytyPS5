@@ -23,7 +23,8 @@ class CommandScheduler {
 public:
 	// asynchronous: commands are recorded into streams that a recording thread replays into
 	// Vulkan command buffers and submits, in order, so the caller's thread does not pay for the
-	// driver's recording and submission (opt-in: KYTY_ASYNC_RECORD=1).
+	// driver's recording and submission. The renderer's scheduler is asynchronous unless
+	// KYTY_ASYNC_RECORD=0.
 	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool asynchronous = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);

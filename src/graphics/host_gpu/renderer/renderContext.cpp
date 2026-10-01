@@ -17,9 +17,10 @@
 
 namespace Libs::Graphics {
 
+// KYTY_ASYNC_RECORD=0 records and submits on the GPU thread itself.
 static bool AsyncRecordingEnabled() {
 	const char* value = std::getenv("KYTY_ASYNC_RECORD");
-	return value != nullptr && std::strcmp(value, "1") == 0;
+	return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
 RenderContext::RenderContext(GraphicContext& graphics)
