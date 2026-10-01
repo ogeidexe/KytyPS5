@@ -242,8 +242,9 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		vk::CommandBufferBeginInfo begin_info {};
 		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 		EXIT_IF(command.begin(&begin_info) != vk::Result::eSuccess);
-		// A barrier's first scope covers everything submitted earlier to this queue, including
-		// the already submitted command buffers that wrote this range.
+		// On the rendering queue, a barrier's first scope covers everything submitted earlier,
+		// including the command buffers that wrote this range. On the readback queue, the wait for
+		// the tick of the buffer's last GPU write (below) orders the copy after those writes.
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
@@ -268,7 +269,19 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                        nullptr);
 		EXIT_IF(command.end() != vk::Result::eSuccess);
 
-		const uint64_t                  signal_value = ++m_readback_tick;
+		// Every GPU write to the buffer is recorded through ObtainBuffer, which stamps the buffer
+		// with its tick, and only those GPU-written ranges are copied here. On its own queue the
+		// copy waits for that tick alone, not behind everything rendered since (often a frame).
+		// KYTY_READBACK_QUEUE=0 submits it to the rendering queue instead.
+		static const bool own_queue_enabled = [] {
+			const char* value = std::getenv("KYTY_READBACK_QUEUE");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		const bool own_queue = own_queue_enabled && m_graphics.readback_queue != nullptr;
+		const vk::Semaphore          wait_semaphore = m_scheduler.GetMasterSemaphore().Handle();
+		const uint64_t               wait_value     = buffer.last_gpu_write_tick;
+		const vk::PipelineStageFlags wait_stage     = vk::PipelineStageFlagBits::eTransfer;
+		const uint64_t               signal_value   = ++m_readback_tick;
 		Common::GpuWaitDiagnostics::Note("readback-submit", signal_value, batch.total_size);
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.signalSemaphoreValueCount = 1;
@@ -279,11 +292,21 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		submit_info.pCommandBuffers      = &command;
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores    = &m_readback_semaphore;
+		if (own_queue) {
+			timeline_info.waitSemaphoreValueCount = 1;
+			timeline_info.pWaitSemaphoreValues    = &wait_value;
+			submit_info.waitSemaphoreCount        = 1;
+			submit_info.pWaitSemaphores           = &wait_semaphore;
+			submit_info.pWaitDstStageMask         = &wait_stage;
+		}
 		// The copies read what earlier GPU work wrote: that work must be in the queue first.
 		CommandScheduler::SubmitOrdering(nullptr);
 		{
-			Common::LockGuard lock(m_graphics.queue_mutex);
-			const auto        result = m_graphics.queue.submit(1, &submit_info, nullptr);
+			auto&             queue_mutex = own_queue ? m_graphics.readback_queue_mutex
+			                                          : m_graphics.queue_mutex;
+			auto              queue = own_queue ? m_graphics.readback_queue : m_graphics.queue;
+			Common::LockGuard lock(queue_mutex);
+			const auto        result = queue.submit(1, &submit_info, nullptr);
 			if (result != vk::Result::eSuccess) {
 				if (result == vk::Result::eErrorDeviceLost) {
 					GpuCheckpoints::ReportDeviceLost(m_graphics.queue);
