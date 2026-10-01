@@ -677,6 +677,10 @@ struct TracedDrawStats {
 	uint64_t                  read   = 0;
 	double                    sum[3] {};
 	double                    max[3] {};
+	// Which traced draw each query measured (trace draw number, submit, checkpoint marker).
+	uint64_t                  draw[Count] {};
+	uint64_t                  submit[Count] {};
+	uint32_t                  marker[Count] {};
 };
 
 static TracedDrawStats* GetTracedDrawStats(vk::Device device) {
@@ -720,6 +724,19 @@ static void CollectTracedDrawStats(vk::Device device, TracedDrawStats& s, uint32
 	for (int i = 0; i < 3; i++) {
 		s.sum[i] += v[i];
 		s.max[i] = std::max(s.max[i], v[i]);
+	}
+	// KYTY_TRACE_STATS_OUTLIER=<fragment shader invocations> (default 2,000,000, ~50x the normal
+	// skinning draw): each traced draw above it is printed on its own, so a stall that completes
+	// shows whether it was this draw doing vastly more fragment work than usual.
+	static const double outlier = [] {
+		const char* value = std::getenv("KYTY_TRACE_STATS_OUTLIER");
+		return value != nullptr ? std::strtod(value, nullptr) : 2'000'000.0;
+	}();
+	if (v[1] > outlier) {
+		std::printf("[trace-stats] OUTLIER trace draw %" PRIu64 " (submit %" PRIu64
+		            ", marker %u): primitives %.0f, fragment invocations %.0f, samples passed %.0f\n",
+		            s.draw[index], s.submit[index], s.marker[index], v[0], v[1], v[2]);
+		std::fflush(stdout);
 	}
 	if (++s.read % 500 == 0) {
 		std::printf("[trace-stats] %" PRIu64 " traced draws: mean primitives %.0f, fragment "
@@ -1491,6 +1508,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                       static_cast<uint32_t>(stats_query));
 			vk_buffer.resetQueryPool(stats->statistics, stats_query, 1);
 			vk_buffer.resetQueryPool(stats->occlusion, stats_query, 1);
+			stats->draw[stats_query]   = slot.draw;
+			stats->submit[stats_query] = submit_id;
+			stats->marker[stats_query] = slot.marker;
 		}
 		const auto dst    = capture.storage->Handle();
 		uint64_t   cursor = 0;
