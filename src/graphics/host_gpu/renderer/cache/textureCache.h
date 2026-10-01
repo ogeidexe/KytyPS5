@@ -142,6 +142,9 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// Caller holds m_lock. The registered image with the same backing as info, when exactly one
+	// has it; otherwise none (the region scan then decides).
+	[[nodiscard]] ImageId       FindUniqueSameBacking(const ImageInfo& info, bool exact_format) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -193,6 +196,8 @@ public:
 
 private:
 	ImagePageTable                                    m_image_page_table;
+	// Registered images by guest data address (the same set as m_image_page_table).
+	std::unordered_map<uint64_t, ImageIds>            m_images_by_address;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

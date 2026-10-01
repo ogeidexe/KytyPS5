@@ -249,6 +249,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -270,6 +271,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	const auto by_address = m_images_by_address.find(image.info.data.address);
+	if (by_address == m_images_by_address.end() || !by_address->second.Erase(id)) {
+		EXIT("TextureCache: image missing from address index\n");
+	}
+	if (by_address->second.empty()) {
+		m_images_by_address.erase(by_address);
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -551,6 +559,24 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		});
 	});
 	return result;
+}
+
+ImageId TextureCache::FindUniqueSameBacking(const ImageInfo& info, bool exact_format) const {
+	// SameBacking requires the same data address, so every match is indexed under it.
+	const auto found = m_images_by_address.find(info.data.address);
+	if (found == m_images_by_address.end()) {
+		return {};
+	}
+	ImageId  match {};
+	uint32_t matches = 0;
+	found->second.ForEach([&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && SameBacking(image->info, info, exact_format)) {
+			match = id;
+			++matches;
+		}
+	});
+	return matches == 1 ? match : ImageId {};
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
@@ -1354,8 +1380,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		int32_t          view_mip   = -1;
+		int32_t          view_layer = -1;
+		// Most lookups name an image already cached with the same backing; only the others scan
+		// every image on the region's pages (several matches keep the scan, its order decides).
+		result = FindUniqueSameBacking(desc.info, exact_format);
+		// KYTY_TEXCACHE_VERIFY=1: check every shortcut against the region scan.
+		static const bool verify = std::getenv("KYTY_TEXCACHE_VERIFY") != nullptr;
+		if (verify && result) {
+			ImageId scanned {};
+			for (const auto id:
+			     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+				if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					scanned = id;
+				}
+			}
+			if (scanned != result) {
+				EXIT("TextureCache: same-backing shortcut disagrees with the region scan, "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     desc.info.data.address, desc.info.data.size);
+			}
+		}
+		const auto candidates =
+		    result ? ImageIds {}
+		           : FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1364,8 +1412,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
