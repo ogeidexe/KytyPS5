@@ -47,6 +47,11 @@ inline std::atomic<uint32_t> g_render_passes {0};
 inline std::atomic<uint32_t> g_render_max_width {0};
 inline std::atomic<uint32_t> g_render_max_height {0};
 inline std::atomic<uint32_t> g_render_passes_4k {0};
+// Pipeline barriers recorded (both vkCmdPipelineBarrier forms), the image layout transitions
+// among them (Image::Transit) and the global barriers guest events ask for (EmitGlobalBarrier).
+inline std::atomic<uint32_t> g_barriers {0};
+inline std::atomic<uint32_t> g_barriers_image_transit {0};
+inline std::atomic<uint32_t> g_barriers_guest_global {0};
 // Shader resource (SRT) evaluation: full evaluations, cache hits, misses by cause, recorded
 // dependency reads re-checked on hits, and verification mismatches (must stay 0).
 inline std::atomic<uint32_t> g_srt_evaluations {0};

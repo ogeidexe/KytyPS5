@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -232,6 +233,7 @@ public:
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images) const {
+		Common::FrameStats::g_barriers.fetch_add(1, std::memory_order_relaxed);
 		const auto* m = Persist(memory, memory_count);
 		const auto* b = Persist(buffers, buffer_count);
 		const auto* i = Persist(images, image_count);
@@ -240,6 +242,7 @@ public:
 		});
 	}
 	void pipelineBarrier2(const vk::DependencyInfo& info) const {
+		Common::FrameStats::g_barriers.fetch_add(1, std::memory_order_relaxed);
 		if (m_stream == nullptr) {
 			m_immediate.pipelineBarrier2(info);
 			return;

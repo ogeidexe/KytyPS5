@@ -1029,6 +1029,10 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_render_max_width.exchange(0),
 			            Common::FrameStats::g_render_max_height.exchange(0),
 			            Common::FrameStats::g_render_passes_4k.exchange(0));
+			std::printf("[frame-stats]   barriers=%u image_transits=%u guest_global=%u\n",
+			            Common::FrameStats::g_barriers.exchange(0),
+			            Common::FrameStats::g_barriers_image_transit.exchange(0),
+			            Common::FrameStats::g_barriers_guest_global.exchange(0));
 			std::printf("[frame-stats]   srt_evals=%u srt_hits=%u srt_miss_inputs=%u"
 			            " srt_miss_memory=%u srt_checked_reads=%llu srt_mismatches=%u"
 			            " srt_dep_words=%llu srt_mask_resets=%u srt_subst=%u\n",

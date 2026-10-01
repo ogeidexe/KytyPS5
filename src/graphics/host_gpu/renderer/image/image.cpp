@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/image/imageHistory.h"
 
 #include "common/assert.h"
+#include "common/frameStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -244,6 +245,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	Common::FrameStats::g_barriers_image_transit.fetch_add(1, std::memory_order_relaxed);
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
