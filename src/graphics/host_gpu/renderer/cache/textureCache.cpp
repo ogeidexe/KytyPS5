@@ -226,7 +226,10 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 static bool TraceImageTicks();
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	const auto id = [&] {
+		Common::FrameStats::TimeScope create_scope(Common::FrameStats::g_image_create_us);
+		return m_slot_images.insert(m_graphics, m_scheduler, info);
+	}();
 	Common::FrameStats::g_image_creates.fetch_add(1, std::memory_order_relaxed);
 	if (TraceImageTicks() && m_scheduler.Active()) {
 		m_image_ticks[id] = {m_scheduler.CurrentTick(), 0};

@@ -971,7 +971,11 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		auto translated = [&] {
+			Common::FrameStats::TimeScope translate_scope(Common::FrameStats::g_translate_us);
+			Common::FrameStats::g_translate_count.fetch_add(1, std::memory_order_relaxed);
+			return ShaderRecompiler::TranslateProgram(params.code, options);
+		}();
 		if (translated.skip_dispatch) {
 			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch = true;

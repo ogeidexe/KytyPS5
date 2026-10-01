@@ -147,6 +147,30 @@ private:
 	uint64_t m_start;
 };
 
+// Guest shader translation (ISA to IR, before CompileScope's SPIR-V and pipeline work), and host
+// image creation (vkCreateImage with its memory): the parts of a hitch the counters above miss.
+inline std::atomic<uint32_t> g_translate_count {0};
+inline std::atomic<uint64_t> g_translate_us {0};
+inline std::atomic<uint64_t> g_image_create_us {0};
+
+// Adds the lifetime of the scope to a microsecond counter.
+class TimeScope {
+public:
+	explicit TimeScope(std::atomic<uint64_t>& us): m_us(us), m_start(Timer::QueryPerformanceCounter()) {}
+	~TimeScope() {
+		const auto elapsed = Timer::QueryPerformanceCounter() - m_start;
+		m_us.fetch_add(elapsed * 1000000 / Timer::QueryPerformanceFrequency(),
+		               std::memory_order_relaxed);
+	}
+
+	TimeScope(const TimeScope&)            = delete;
+	TimeScope& operator=(const TimeScope&) = delete;
+
+private:
+	std::atomic<uint64_t>& m_us;
+	uint64_t               m_start;
+};
+
 // Adds the lifetime of the scope to g_fault_us and counts it in g_fault_count.
 class FaultScope {
 public:
