@@ -2073,14 +2073,14 @@ public:
     scheduler.Begin(registers, user_config, shaders);
 
     auto *command = &scheduler.Current();
-    const auto original_handle = command->Handle();
+    const auto original_handle = command->ImmediateHandle();
     HW::Context next_registers{};
     HW::UserConfig next_user_config{};
     HW::Shader next_shaders{};
     scheduler.Begin(next_registers, next_user_config, next_shaders);
     Require("SchedulerTimeline", "guest context rebind",
             &scheduler.Current() == command &&
-                command->Handle() == original_handle &&
+                command->ImmediateHandle() == original_handle &&
                 &command->GetRegisters() == &next_registers &&
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
@@ -2157,7 +2157,7 @@ public:
     constexpr size_t blocked_submission_count = 6;
     std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles{};
     for (size_t i = 0; i < blocked_submission_count; ++i) {
-      blocked_handles[i] = scheduler.Current().Handle();
+      blocked_handles[i] = scheduler.Current().ImmediateHandle();
       if (i == 0) {
         scheduler.Flush(external_wait);
       } else {
@@ -2191,7 +2191,7 @@ public:
     scheduler.Flush();
     Require(
         "SchedulerTimeline", "timeline pool reuse",
-        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+        std::ranges::find(blocked_handles, scheduler.Current().ImmediateHandle()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();

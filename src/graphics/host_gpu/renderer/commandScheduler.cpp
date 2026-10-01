@@ -15,8 +15,11 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
-// The scheduler whose submissions are made by its recording thread (at most one: the renderer's).
-static std::atomic<CommandScheduler*> g_async_scheduler {nullptr};
+// Schedulers whose submissions are made by their recording threads (the renderer's; tests can
+// run several renderers at once). The count lets SubmitOrdering skip the lock when there are none.
+static std::mutex                     g_async_schedulers_mutex;
+static std::vector<CommandScheduler*> g_async_schedulers;
+static std::atomic<size_t>            g_async_scheduler_count {0};
 
 namespace {
 
@@ -106,9 +109,10 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
       m_asynchronous(asynchronous) {
 	if (m_asynchronous) {
-		CommandScheduler* expected = nullptr;
-		EXIT_IF(!g_async_scheduler.compare_exchange_strong(expected, this));
 		m_recording_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+		std::lock_guard lock(g_async_schedulers_mutex);
+		g_async_schedulers.push_back(this);
+		g_async_scheduler_count.store(g_async_schedulers.size(), std::memory_order_release);
 	}
 }
 
@@ -121,6 +125,13 @@ void CommandScheduler::StopRecordingThread() {
 	if (!m_recording_thread.joinable()) {
 		return;
 	}
+	{
+		// SubmitOrdering holds the lock while it waits on a scheduler, so this one stays alive
+		// until no submitter can still be waiting on it.
+		std::lock_guard lock(g_async_schedulers_mutex);
+		std::erase(g_async_schedulers, this);
+		g_async_scheduler_count.store(g_async_schedulers.size(), std::memory_order_release);
+	}
 	WaitRecordingIdle();
 	{
 		// Under the mutex, so the recording thread cannot miss the stop between its check and
@@ -130,8 +141,6 @@ void CommandScheduler::StopRecordingThread() {
 	}
 	m_batch_available.notify_all();
 	m_recording_thread.join();
-	CommandScheduler* expected = this;
-	g_async_scheduler.compare_exchange_strong(expected, nullptr);
 }
 
 void CommandScheduler::WaitRecordingIdle() {
@@ -143,9 +152,14 @@ void CommandScheduler::WaitRecordingIdle() {
 }
 
 void CommandScheduler::SubmitOrdering(const CommandScheduler* submitter) {
-	auto* async = g_async_scheduler.load(std::memory_order_acquire);
-	if (async != nullptr && async != submitter) {
-		async->WaitRecordingIdle();
+	if (g_async_scheduler_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	std::lock_guard lock(g_async_schedulers_mutex);
+	for (auto* async: g_async_schedulers) {
+		if (async != submitter) {
+			async->WaitRecordingIdle();
+		}
 	}
 }
 

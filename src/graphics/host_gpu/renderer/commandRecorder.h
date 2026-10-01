@@ -309,6 +309,12 @@ public:
 		const auto* st = Persist(strides, count);
 		Run([=](vk::CommandBuffer c) { c.bindVertexBuffers2(first, count, b, o, s, st); });
 	}
+	void bindVertexBuffers(uint32_t first, uint32_t count, const vk::Buffer* buffers,
+	                       const vk::DeviceSize* offsets) const {
+		const auto* b = Persist(buffers, count);
+		const auto* o = Persist(offsets, count);
+		Run([=](vk::CommandBuffer c) { c.bindVertexBuffers(first, count, b, o); });
+	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
 		Run([=](vk::CommandBuffer c) { c.bindIndexBuffer(buffer, offset, type); });
 	}
@@ -455,6 +461,16 @@ public:
 		const auto* k = Persist(color, 1);
 		const auto* r = Persist(ranges, count);
 		Run([=](vk::CommandBuffer c) { c.clearColorImage(image, layout, k, count, r); });
+	}
+	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue& color,
+	                     vk::ArrayProxy<const vk::ImageSubresourceRange> const& ranges) const {
+		clearColorImage(image, layout, &color, ranges.size(), ranges.data());
+	}
+	void clearAttachments(uint32_t attachment_count, const vk::ClearAttachment* attachments,
+	                      uint32_t rect_count, const vk::ClearRect* rects) const {
+		const auto* a = Persist(attachments, attachment_count);
+		const auto* r = Persist(rects, rect_count);
+		Run([=](vk::CommandBuffer c) { c.clearAttachments(attachment_count, a, rect_count, r); });
 	}
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
