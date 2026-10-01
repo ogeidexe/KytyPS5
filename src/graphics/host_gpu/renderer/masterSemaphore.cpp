@@ -5,6 +5,7 @@
 #include "common/gpuWaitDiagnostics.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <chrono>
 #include <cstdio>
 
 namespace Libs::Graphics {
@@ -65,6 +66,8 @@ void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t va
 	const bool     diagnostics = Common::GpuWaitDiagnostics::Enabled();
 	const uint64_t slice_ns    = diagnostics ? 2'000'000'000ull : 1'000'000'000ull;
 	vk::Result     result      = vk::Result::eSuccess;
+	bool           stalled     = false;
+	const auto     wait_start  = std::chrono::steady_clock::now();
 	for (uint32_t slice = 1;; slice++) {
 		result = graphics.device.waitSemaphores(&wait_info, slice_ns);
 		if (result != vk::Result::eTimeout) {
@@ -86,6 +89,8 @@ void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t va
 			              static_cast<unsigned long long>(value),
 			              static_cast<unsigned long long>(counter),
 			              static_cast<unsigned long long>(next_unsubmitted));
+			GpuCheckpoints::ReportStall("in progress");
+			stalled = true;
 			if (slice == 1 || slice % 5 == 0) {
 				Common::GpuWaitDiagnostics::Dump(header);
 			} else {
@@ -93,6 +98,16 @@ void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t va
 				std::fflush(stdout);
 			}
 		}
+	}
+	if (stalled && result == vk::Result::eSuccess) {
+		// The GPU finished the stalled work: a stall that stayed under the OS reset timeout.
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+		                                                          wait_start)
+		                    .count();
+		std::printf("[gpu-wait] timeline %p (%s): value %llu reached after %.1f ms\n",
+		            static_cast<void*>(static_cast<VkSemaphore>(semaphore)), what,
+		            static_cast<unsigned long long>(value), ms);
+		GpuCheckpoints::ReportStall("recovered");
 	}
 	if (result == vk::Result::eErrorDeviceLost) {
 		GpuCheckpoints::ReportDeviceLost(graphics.queue);

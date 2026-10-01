@@ -1065,6 +1065,10 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
+		if (Common::GpuWaitDiagnostics::Enabled() && std::getenv("KYTY_GPU_MARKERS") != nullptr &&
+		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		}
 		if (std::getenv("KYTY_NV_DIAG_CONFIG") != nullptr &&
 		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
@@ -1087,7 +1091,7 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	if (Common::GpuWaitDiagnostics::Enabled()) {
-		GpuCheckpoints::Initialize(graphic_ctx.device);
+		GpuCheckpoints::Initialize(graphic_ctx.device, graphic_ctx.physical_device);
 	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);

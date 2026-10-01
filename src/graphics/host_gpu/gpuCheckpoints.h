@@ -40,6 +40,13 @@ struct State {
 	std::atomic<bool>              report_done {false};
 	PFN_vkGetDeviceFaultInfoEXT    get_fault = nullptr;
 	VkDevice                       device    = VK_NULL_HANDLE;
+	// KYTY_GPU_MARKERS=1 (VK_AMD_buffer_marker): the GPU also writes each marker index to host
+	// memory when the work before it reached the top ([0]) and the bottom ([1]) of the pipe. Unlike
+	// checkpoint data, which may only be queried once the device is lost, these can be read while
+	// a stall is still in progress (and after one that recovers).
+	PFN_vkCmdWriteBufferMarkerAMD  write_marker  = nullptr;
+	VkBuffer                       marker_buffer = VK_NULL_HANDLE;
+	volatile uint32_t*             markers       = nullptr;
 };
 
 inline State& GetState() {
@@ -47,8 +54,40 @@ inline State& GetState() {
 	return state;
 }
 
+inline void CreateMarkerBuffer(State& s, vk::PhysicalDevice physical_device) {
+	const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	VkBufferCreateInfo buffer_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	buffer_info.size  = 64;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	if (d.vkCreateBuffer(s.device, &buffer_info, nullptr, &s.marker_buffer) != VK_SUCCESS) {
+		return;
+	}
+	VkMemoryRequirements requirements {};
+	d.vkGetBufferMemoryRequirements(s.device, s.marker_buffer, &requirements);
+	const auto properties = physical_device.getMemoryProperties();
+	const auto wanted     = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		if ((requirements.memoryTypeBits & (1u << type)) == 0 ||
+		    (properties.memoryTypes[type].propertyFlags & wanted) != wanted) {
+			continue;
+		}
+		VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		allocate.allocationSize  = requirements.size;
+		allocate.memoryTypeIndex = type;
+		VkDeviceMemory memory    = VK_NULL_HANDLE;
+		void*          mapped    = nullptr;
+		if (d.vkAllocateMemory(s.device, &allocate, nullptr, &memory) == VK_SUCCESS &&
+		    d.vkBindBufferMemory(s.device, s.marker_buffer, memory, 0) == VK_SUCCESS &&
+		    d.vkMapMemory(s.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+			s.markers = static_cast<volatile uint32_t*>(mapped);
+			s.markers[0] = s.markers[1] = 0;
+		}
+		return;
+	}
+}
+
 // Call after VULKAN_HPP_DEFAULT_DISPATCHER was initialized for a device created with the extension.
-inline void Initialize(vk::Device device) {
+inline void Initialize(vk::Device device, vk::PhysicalDevice physical_device) {
 	auto& s          = GetState();
 	s.device         = static_cast<VkDevice>(device);
 	ImageHistory::g_marker_counter = &s.next;
@@ -59,16 +98,26 @@ inline void Initialize(vk::Device device) {
 	s.set_checkpoint = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV;
 	s.get_data       = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV;
 	if (s.set_checkpoint != nullptr && s.get_data != nullptr) {
-		s.records = std::make_unique<Record[]>(State::Size);
 		std::printf("[gpu-wait] device diagnostic checkpoints enabled\n");
 	} else {
 		s.set_checkpoint = nullptr;
+	}
+	if (std::getenv("KYTY_GPU_MARKERS") != nullptr &&
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD != nullptr) {
+		CreateMarkerBuffer(s, physical_device);
+		if (s.markers != nullptr) {
+			s.write_marker = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD;
+			std::printf("[gpu-wait] buffer markers enabled\n");
+		}
+	}
+	if (s.set_checkpoint != nullptr || s.write_marker != nullptr) {
+		s.records = std::make_unique<Record[]>(State::Size);
 	}
 }
 
 inline void Mark(vk::CommandBuffer command, const Record& record) {
 	auto& s = GetState();
-	if (s.set_checkpoint == nullptr || !command) {
+	if (!s.records || !command) {
 		return;
 	}
 	auto index = s.next.fetch_add(1, std::memory_order_relaxed) & (State::Size - 1u);
@@ -76,8 +125,37 @@ inline void Mark(vk::CommandBuffer command, const Record& record) {
 		index = 1; // a null marker is indistinguishable from none
 	}
 	s.records[index] = record;
-	s.set_checkpoint(static_cast<VkCommandBuffer>(command),
-	                 reinterpret_cast<void*>(static_cast<uintptr_t>(index)));
+	if (s.set_checkpoint != nullptr) {
+		s.set_checkpoint(static_cast<VkCommandBuffer>(command),
+		                 reinterpret_cast<void*>(static_cast<uintptr_t>(index)));
+	}
+	if (s.write_marker != nullptr) {
+		s.write_marker(static_cast<VkCommandBuffer>(command), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		               s.marker_buffer, 0, index);
+		s.write_marker(static_cast<VkCommandBuffer>(command), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		               s.marker_buffer, 4, index);
+	}
+}
+
+// KYTY_GPU_MARKERS only: while a wait for the GPU is stalled (or right after), the work between
+// the newest marker whose preceding work finished and the newest one the GPU started.
+inline void ReportStall(const char* when) {
+	auto& s = GetState();
+	if (s.markers == nullptr) {
+		return;
+	}
+	const uint32_t top    = s.markers[0];
+	const uint32_t bottom = s.markers[1];
+	const auto     span   = (top - bottom) & (State::Size - 1u);
+	std::printf("[gpu-wait] stall %s: bottom marker %u, top marker %u (%u records)\n", when,
+	            bottom, top, span);
+	for (uint32_t k = 0; k <= std::min(span + 1u, 64u); k++) {
+		const auto  index = (bottom + k) & (State::Size - 1u);
+		const auto& n     = s.records[index];
+		std::printf("[gpu-wait]   %u op=%u submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		            index, n.op, n.submit, n.arg0, n.arg1, n.arg2, n.arg3, n.arg4);
+	}
+	std::fflush(stdout);
 }
 
 // Valid only after the device reported VK_ERROR_DEVICE_LOST. Prints once.
