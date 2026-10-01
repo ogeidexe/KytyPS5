@@ -13,6 +13,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/shader.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -130,6 +131,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	// IR integrity checks cost about a fifth of shader translation; they run with SPIR-V validation.
+	Libs::Graphics::ShaderSetProgramValidation(Config::ShaderValidationEnabled());
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

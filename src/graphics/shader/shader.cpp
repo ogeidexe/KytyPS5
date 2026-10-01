@@ -66,6 +66,10 @@ struct ShaderBinaryInfo {
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
 
+void ShaderSetProgramValidation(bool enabled) {
+	ShaderRecompiler::IR::SetProgramValidation(enabled);
+}
+
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
 

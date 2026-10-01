@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <atomic>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -203,6 +204,16 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+static std::atomic<bool> g_program_validation {true};
+
+void SetProgramValidation(bool enabled) {
+	g_program_validation.store(enabled, std::memory_order_relaxed);
+}
+
+bool ProgramValidationEnabled() {
+	return g_program_validation.load(std::memory_order_relaxed);
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

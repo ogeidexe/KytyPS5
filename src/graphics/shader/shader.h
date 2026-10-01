@@ -303,6 +303,8 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// IR integrity checks during shader translation (ShaderRecompiler::IR::ValidateProgram).
+void ShaderSetProgramValidation(bool enabled);
 // Installed by the renderer: copies guest bytes only when guest memory is authoritative for them
 // (BufferCache::TryReadCleanBytes), returning false otherwise. Used for the vertex tables read on
 // every draw, which often share a page with GPU-written data. GPU thread only.

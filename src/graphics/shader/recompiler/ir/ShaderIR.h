@@ -603,6 +603,10 @@ std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Whether translation and SPIR-V emission run ValidateProgram (integrity checks that never change
+// the result). On unless turned off; the emulator follows --shader-validation.
+void  SetProgramValidation(bool enabled);
+bool  ProgramValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
