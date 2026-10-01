@@ -191,7 +191,6 @@ struct DepthRenderTarget {
 };
 
 struct RenderControl {
-	uint32_t raw                     = 0; // the register as written (diagnostics)
 	bool    depth_clear_enable       = false;
 	bool    stencil_clear_enable     = false;
 	bool    resummarize_enable       = false;
@@ -201,14 +200,17 @@ struct RenderControl {
 	bool    copy_stencil_to_color    = false;
 	bool    copy_centroid            = false;
 	uint8_t copy_sample              = 0;
+	// The register as written (diagnostics). Last, so positional initializers (tests) still
+	// name the fields above; the same holds for DepthRenderOverride and DepthShaderControl.
+	uint32_t raw = 0;
 };
 
 struct DepthRenderOverride {
-	uint32_t raw             = 0; // the register as written (diagnostics)
-	bool force_z_valid       = false;
-	bool force_z_dirty       = false;
-	bool force_stencil_valid = false;
-	bool force_stencil_dirty = false;
+	bool     force_z_valid       = false;
+	bool     force_z_dirty       = false;
+	bool     force_stencil_valid = false;
+	bool     force_stencil_dirty = false;
+	uint32_t raw                 = 0; // the register as written (diagnostics); last
 };
 
 struct GdsOaCounter {
@@ -350,7 +352,6 @@ struct AaSampleControl {
 };
 
 struct DepthShaderControl {
-	uint32_t raw                         = 0; // the register as written (diagnostics)
 	uint32_t other_bits                  = 0;
 	uint8_t  conservative_z_export_value = 0;
 	uint8_t  shader_z_behavior           = 0;
@@ -360,6 +361,7 @@ struct DepthShaderControl {
 	bool     shader_dual_export_enable   = false;
 	bool     shader_execute_on_noop      = false;
 	bool     alpha_to_mask_disable       = false;
+	uint32_t raw                         = 0; // the register as written (diagnostics); last
 };
 
 struct AaConfig {
