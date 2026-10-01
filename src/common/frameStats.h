@@ -33,6 +33,12 @@ inline std::atomic<uint32_t> g_indirect_gpu_written {0};
 inline std::atomic<uint32_t> g_indirect_zero {0};
 inline std::atomic<uint32_t> g_indirect_speculated {0};
 inline std::atomic<uint64_t> g_indirect_stall_us {0};
+// Occlusion queries: counter dumps (ZPASS_DONE), ZPASS predications, how many of those skipped
+// their packets and how many found the results not ready yet.
+inline std::atomic<uint32_t> g_occlusion_dumps {0};
+inline std::atomic<uint32_t> g_zpass_predications {0};
+inline std::atomic<uint32_t> g_zpass_predication_skips {0};
+inline std::atomic<uint32_t> g_zpass_predication_not_ready {0};
 // Shader resource (SRT) evaluation: full evaluations, cache hits, misses by cause, recorded
 // dependency reads re-checked on hits, and verification mismatches (must stay 0).
 inline std::atomic<uint32_t> g_srt_evaluations {0};

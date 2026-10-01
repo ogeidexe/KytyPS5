@@ -959,6 +959,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			Common::FrameStats::g_zpass_predications.fetch_add(1, std::memory_order_relaxed);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -966,6 +967,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
+					Common::FrameStats::g_zpass_predication_not_ready.fetch_add(
+					    1, std::memory_order_relaxed);
 					if (wait_op == 0) {
 						SuspendPm4();
 					} else {
@@ -989,6 +992,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	if (op == 0x01 && m_predicate_skip) {
+		Common::FrameStats::g_zpass_predication_skips.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (op == 0x03) {
 		static std::atomic<uint32_t> log_count {0};
@@ -1617,6 +1623,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			Common::FrameStats::g_occlusion_dumps.fetch_add(1, std::memory_order_relaxed);
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "

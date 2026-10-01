@@ -1016,6 +1016,12 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_indirect_zero.exchange(0),
 			            Common::FrameStats::g_indirect_speculated.exchange(0),
 			            Common::FrameStats::g_indirect_stall_us.exchange(0) / 1000.0);
+			std::printf("[frame-stats]   occlusion_dumps=%u zpass_pred=%u zpass_skip=%u"
+			            " zpass_not_ready=%u\n",
+			            Common::FrameStats::g_occlusion_dumps.exchange(0),
+			            Common::FrameStats::g_zpass_predications.exchange(0),
+			            Common::FrameStats::g_zpass_predication_skips.exchange(0),
+			            Common::FrameStats::g_zpass_predication_not_ready.exchange(0));
 			std::printf("[frame-stats]   srt_evals=%u srt_hits=%u srt_miss_inputs=%u"
 			            " srt_miss_memory=%u srt_checked_reads=%llu srt_mismatches=%u"
 			            " srt_dep_words=%llu srt_mask_resets=%u srt_subst=%u\n",
