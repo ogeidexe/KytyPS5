@@ -110,14 +110,17 @@ public:
 	Inst(Inst&&)                 = delete;
 	Inst& operator=(Inst&&)      = delete;
 
-	[[nodiscard]] ValueOpcode             GetOpcode() const;
+	[[nodiscard]] ValueOpcode             GetOpcode() const { return opcode; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
 	[[nodiscard]] bool                    HasUses() const;
 	[[nodiscard]] size_t                  UseCount() const;
 	[[nodiscard]] size_t                  NumArgs() const;
 	[[nodiscard]] size_t                  NumPhiBlocks() const;
-	[[nodiscard]] Value                   Arg(size_t index) const;
+	[[nodiscard]] Value                   Arg(size_t index) const {
+		EXIT_IF(index >= args.size());
+		return args[index];
+	}
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
@@ -152,6 +155,8 @@ public:
 	}
 
 private:
+	friend class Value; // Value::Resolve walks identity chains through args directly
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
@@ -164,5 +169,32 @@ private:
 	std::vector<Use>    uses;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
+
+// Defined here so the hot shader-resource evaluation (SrtWalker) does not pay a call, and a
+// recursion level per identity, for every operand it follows.
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	const Value* value = this;
+	EXIT_IF(value->type != Type::Opaque);
+	while (value->inst->GetOpcode() == ValueOpcode::Identity) {
+		EXIT_IF(value->inst->args.empty());
+		const Value& next = value->inst->args[0];
+		EXIT_IF(next.type != Type::Opaque);
+		value = &next;
+	}
+	return value->inst;
+}
+
+inline Value Value::Resolve() const {
+	const Value* value = this;
+	while (value->IsIdentity()) {
+		EXIT_IF(value->inst->args.empty());
+		value = &value->inst->args[0];
+	}
+	return *value;
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
