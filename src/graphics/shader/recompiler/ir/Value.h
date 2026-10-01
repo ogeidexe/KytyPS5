@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -100,6 +102,67 @@ struct Use {
 	bool operator==(const Use&) const = default;
 };
 
+// An instruction's operands. Up to four live inside the instruction, so following an operand
+// does not first load a separately allocated array (shader-resource evaluation walks operand
+// chains for every draw); longer lists (phis) move to the heap.
+class OperandList {
+public:
+	OperandList() noexcept: m_inline {} {}
+	~OperandList() {
+		if (m_capacity != 0) {
+			delete[] m_heap;
+		}
+	}
+	OperandList(const OperandList&)            = delete;
+	OperandList& operator=(const OperandList&) = delete;
+
+	[[nodiscard]] size_t       size() const noexcept { return m_size; }
+	[[nodiscard]] bool         empty() const noexcept { return m_size == 0; }
+	[[nodiscard]] Value*       data() noexcept { return m_capacity != 0 ? m_heap : m_inline.data(); }
+	[[nodiscard]] const Value* data() const noexcept {
+		return m_capacity != 0 ? m_heap : m_inline.data();
+	}
+	[[nodiscard]] Value&       operator[](size_t index) noexcept { return data()[index]; }
+	[[nodiscard]] const Value& operator[](size_t index) const noexcept { return data()[index]; }
+	[[nodiscard]] const Value& front() const noexcept { return data()[0]; }
+
+	void resize(size_t count) {
+		Reserve(count);
+		std::fill(data() + std::min<size_t>(m_size, count), data() + count, Value {});
+		m_size = static_cast<uint32_t>(count);
+	}
+	void push_back(Value value) {
+		Reserve(m_size + size_t {1});
+		data()[m_size++] = value;
+	}
+	void clear() noexcept { m_size = 0; }
+
+private:
+	static constexpr size_t InlineCapacity = 4;
+
+	void Reserve(size_t count) {
+		const size_t capacity = m_capacity != 0 ? m_capacity : InlineCapacity;
+		if (count <= capacity) {
+			return;
+		}
+		const size_t grown = std::max(count, capacity * 2);
+		auto*        heap  = new Value[grown];
+		std::copy_n(data(), m_size, heap);
+		if (m_capacity != 0) {
+			delete[] m_heap;
+		}
+		m_heap     = heap;
+		m_capacity = static_cast<uint32_t>(grown);
+	}
+
+	uint32_t m_size     = 0;
+	uint32_t m_capacity = 0; // 0: the inline storage is in use
+	union {
+		std::array<Value, InlineCapacity> m_inline;
+		Value*                            m_heap;
+	};
+};
+
 class Inst {
 public:
 	explicit Inst(ValueOpcode opcode, uint64_t flags = 0);
@@ -164,7 +227,7 @@ private:
 	ValueOpcode         opcode;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	std::vector<Value>  args;
+	OperandList         args;
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
