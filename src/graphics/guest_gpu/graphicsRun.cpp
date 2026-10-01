@@ -465,6 +465,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
+	Common::FrameStats::g_guest_timestamps.fetch_add(1, std::memory_order_relaxed);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -1430,6 +1431,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 			} else {
 				if (event_write_source == 0x04) {
+					Common::FrameStats::g_guest_timestamps.fetch_add(1, std::memory_order_relaxed);
 					value = Sync::ReadReferenceClock();
 				}
 				auto write64 = [&](bool with_writeback) {

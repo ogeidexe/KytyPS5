@@ -39,6 +39,14 @@ inline std::atomic<uint32_t> g_occlusion_dumps {0};
 inline std::atomic<uint32_t> g_zpass_predications {0};
 inline std::atomic<uint32_t> g_zpass_predication_skips {0};
 inline std::atomic<uint32_t> g_zpass_predication_not_ready {0};
+// GPU timestamps the guest asked for (end-of-pipe timestamp writes and reference-clock copies),
+// all stamped when the GPU thread parses the packet rather than when the GPU gets there.
+inline std::atomic<uint32_t> g_guest_timestamps {0};
+// Render passes begun, the largest render area among them, and how many were 3840 wide or more.
+inline std::atomic<uint32_t> g_render_passes {0};
+inline std::atomic<uint32_t> g_render_max_width {0};
+inline std::atomic<uint32_t> g_render_max_height {0};
+inline std::atomic<uint32_t> g_render_passes_4k {0};
 // Shader resource (SRT) evaluation: full evaluations, cache hits, misses by cause, recorded
 // dependency reads re-checked on hits, and verification mismatches (must stay 0).
 inline std::atomic<uint32_t> g_srt_evaluations {0};

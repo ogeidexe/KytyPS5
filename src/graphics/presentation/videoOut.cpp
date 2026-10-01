@@ -1466,6 +1466,11 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	// The size the game renders its frames at, which need not match the host window.
+	std::printf("[video-out] buffer set %d: %d buffers of %" PRIu32 "x%" PRIu32
+	            ", format 0x%016" PRIx64 ", category %d\n",
+	            set_index, buffer_num, attribute->width, attribute->height, attribute->pixel_format,
+	            category);
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;

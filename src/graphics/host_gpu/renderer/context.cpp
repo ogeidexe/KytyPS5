@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "common/common.h"
+#include "common/frameStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -76,6 +77,12 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	Common::FrameStats::g_render_passes.fetch_add(1, std::memory_order_relaxed);
+	Common::FrameStats::StoreMax(Common::FrameStats::g_render_max_width, state.width);
+	Common::FrameStats::StoreMax(Common::FrameStats::g_render_max_height, state.height);
+	if (state.width >= 3840) {
+		Common::FrameStats::g_render_passes_4k.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
