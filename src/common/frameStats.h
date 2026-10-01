@@ -21,6 +21,8 @@ inline std::atomic<uint32_t> g_submit_wait_max_us {0};
 inline std::atomic<uint32_t> g_flip_latency_max_us {0};
 inline std::atomic<uint64_t> g_flip_latency_sum_us {0};
 inline std::atomic<uint32_t> g_flip_count {0};
+// Guest flips requested since boot (never reset): the guest frame number input recording uses.
+inline std::atomic<uint64_t> g_guest_flips {0};
 inline std::atomic<uint32_t> g_flip_pending_max {0};
 // Synchronous GPU-to-CPU buffer readbacks and the time spent waiting on them.
 inline std::atomic<uint32_t> g_readback_count {0};

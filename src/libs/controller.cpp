@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/frameStats.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -142,6 +145,119 @@ private:
 };
 
 static GameController* g_controller = nullptr;
+
+// KYTY_INPUT_RECORD=<file> logs the pad state the guest reads, by guest frame (video-out flips
+// requested so far), whenever it changes. KYTY_INPUT_REPLAY=<file> feeds such a log back instead
+// of the host controllers, so a play session can be repeated without a player (testing).
+namespace InputTape {
+
+struct Entry {
+	uint64_t        frame = 0;
+	ControllerState state;
+};
+
+static Common::Mutex      g_mutex;
+static FILE*              g_record      = nullptr;
+static bool               g_record_open = false;
+static ControllerState    g_last_recorded;
+static bool               g_has_recorded = false;
+static std::vector<Entry> g_replay;
+static size_t             g_replay_next = 0;
+static ControllerState    g_replay_state;
+
+static bool SameInput(const ControllerState& a, const ControllerState& b) {
+	if (a.buttons != b.buttons || a.accel != b.accel || a.gyro != b.gyro ||
+	    a.orientation != b.orientation) {
+		return false;
+	}
+	for (int i = 0; i < static_cast<int>(Axis::AxisMax); i++) {
+		if (a.axes[i] != b.axes[i]) {
+			return false;
+		}
+	}
+	for (int i = 0; i < 2; i++) {
+		if (a.touch[i].down != b.touch[i].down || a.touch[i].x != b.touch[i].x ||
+		    a.touch[i].y != b.touch[i].y || a.touch[i].id != b.touch[i].id) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static uint64_t CurrentFrame() {
+	return Common::FrameStats::g_guest_flips.load(std::memory_order_relaxed);
+}
+
+static bool Replaying() {
+	static const bool enabled = [] {
+		const char* path = std::getenv("KYTY_INPUT_REPLAY");
+		if (path == nullptr || *path == '\0') {
+			return false;
+		}
+		FILE* file = std::fopen(path, "r");
+		EXIT_IF(file == nullptr);
+		Entry entry;
+		auto& s = entry.state;
+		int   t0d = 0, t1d = 0, t0i = 0, t1i = 0, t0x = 0, t0y = 0, t1x = 0, t1y = 0;
+		while (std::fscanf(file,
+		                   "%llu %u %d %d %d %d %d %d %d %d %d %d %d %d %d %d %g %g %g %g %g %g %g %g %g %g",
+		                   reinterpret_cast<unsigned long long*>(&entry.frame), &s.buttons, &s.axes[0],
+		                   &s.axes[1], &s.axes[2], &s.axes[3], &s.axes[4], &s.axes[5], &t0d, &t0i, &t0x,
+		                   &t0y, &t1d, &t1i, &t1x, &t1y, &s.accel[0], &s.accel[1], &s.accel[2],
+		                   &s.gyro[0], &s.gyro[1], &s.gyro[2], &s.orientation[0], &s.orientation[1],
+		                   &s.orientation[2], &s.orientation[3]) == 26) {
+			s.touch[0] = {static_cast<uint8_t>(t0i), t0d != 0, static_cast<uint16_t>(t0x),
+			              static_cast<uint16_t>(t0y)};
+			s.touch[1] = {static_cast<uint8_t>(t1i), t1d != 0, static_cast<uint16_t>(t1x),
+			              static_cast<uint16_t>(t1y)};
+			g_replay.push_back(entry);
+		}
+		std::fclose(file);
+		std::printf("[input] replaying %zu pad states from %s\n", g_replay.size(), path);
+		return true;
+	}();
+	return enabled;
+}
+
+static void Record(const ControllerState& state) {
+	Common::LockGuard lock(g_mutex);
+	if (!g_record_open) {
+		g_record_open    = true;
+		const char* path = std::getenv("KYTY_INPUT_RECORD");
+		if (path != nullptr && *path != '\0') {
+			g_record = std::fopen(path, "w");
+			EXIT_IF(g_record == nullptr);
+		}
+	}
+	if (g_record == nullptr || (g_has_recorded && SameInput(state, g_last_recorded))) {
+		return;
+	}
+	g_last_recorded = state;
+	g_has_recorded  = true;
+	const auto& s   = state;
+	std::fprintf(g_record,
+	             "%llu %u %d %d %d %d %d %d %d %d %d %d %d %d %d %d %g %g %g %g %g %g %g %g %g %g\n",
+	             static_cast<unsigned long long>(CurrentFrame()), s.buttons, s.axes[0], s.axes[1],
+	             s.axes[2], s.axes[3], s.axes[4], s.axes[5], s.touch[0].down ? 1 : 0, s.touch[0].id,
+	             s.touch[0].x, s.touch[0].y, s.touch[1].down ? 1 : 0, s.touch[1].id, s.touch[1].x,
+	             s.touch[1].y, s.accel[0], s.accel[1], s.accel[2], s.gyro[0], s.gyro[1], s.gyro[2],
+	             s.orientation[0], s.orientation[1], s.orientation[2], s.orientation[3]);
+	std::fflush(g_record);
+}
+
+// The recorded state for the current guest frame, with a fresh timestamp.
+static ControllerState Replay() {
+	Common::LockGuard lock(g_mutex);
+	const auto        frame = CurrentFrame();
+	while (g_replay_next < g_replay.size() && g_replay[g_replay_next].frame <= frame) {
+		g_replay_state = g_replay[g_replay_next++].state;
+	}
+	auto state = g_replay_state;
+	state.time = static_cast<uint64_t>(SDL_GetTicksNS() / 1000u);
+	return state;
+}
+
+} // namespace InputTape
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -863,7 +979,14 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	bool            connected       = false;
 	ControllerState state;
 
-	g_controller->ReadState(&state, &connected, &connected_count);
+	if (InputTape::Replaying()) {
+		state           = InputTape::Replay();
+		connected       = true;
+		connected_count = 1;
+	} else {
+		g_controller->ReadState(&state, &connected, &connected_count);
+		InputTape::Record(state);
+	}
 
 	pad_fill_data(data, state, connected, connected_count);
 
@@ -887,13 +1010,22 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
-	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
+	int ret_num = 0;
+	if (InputTape::Replaying()) {
+		states[0]       = InputTape::Replay();
+		connected       = true;
+		connected_count = 1;
+		ret_num         = 1;
+	} else {
+		ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
-	if (!connected || ret_num == 0) {
-		if (connected) {
-			g_controller->ReadState(&states[0], &connected, &connected_count);
+		if (!connected || ret_num == 0) {
+			if (connected) {
+				g_controller->ReadState(&states[0], &connected, &connected_count);
+			}
+			ret_num = 1;
 		}
-		ret_num = 1;
+		InputTape::Record(states[ret_num - 1]);
 	}
 
 	for (int i = 0; i < ret_num; i++) {

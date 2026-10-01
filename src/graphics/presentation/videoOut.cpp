@@ -538,6 +538,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
+	Common::FrameStats::g_guest_flips.fetch_add(1, std::memory_order_relaxed);
 	return OK;
 }
 
