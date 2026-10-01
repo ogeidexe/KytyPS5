@@ -83,6 +83,10 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// Bumped whenever a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t BufferSetGeneration() const noexcept {
+		return m_buffer_set_generation.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// Copies [vaddr, vaddr + size) from guest memory when guest memory is authoritative for exactly
 	// those bytes: none is GPU-modified or awaiting an eager write-back, and no GPU-modified image
@@ -219,6 +223,7 @@ private:
 	void                                 ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	std::mutex                           m_known_fills_mutex;
 	std::map<uint64_t, KnownFill>        m_known_fills;
+	std::atomic<uint64_t>                m_buffer_set_generation {0};
 };
 
 } // namespace Libs::Graphics

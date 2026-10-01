@@ -56,6 +56,9 @@ inline std::atomic<uint32_t> g_barriers_image_transit {0};
 inline std::atomic<uint32_t> g_barriers_guest_global {0};
 // Guest global barriers left out because no work was recorded since the previous one.
 inline std::atomic<uint32_t> g_barriers_guest_elided {0};
+// RenderContext::PrepareBda: full buffer synchronizations, and calls with nothing new to upload.
+inline std::atomic<uint32_t> g_bda_full_syncs {0};
+inline std::atomic<uint32_t> g_bda_skipped_syncs {0};
 // Shader resource (SRT) evaluation: full evaluations, cache hits, misses by cause, recorded
 // dependency reads re-checked on hits, and verification mismatches (must stay 0).
 inline std::atomic<uint32_t> g_srt_evaluations {0};

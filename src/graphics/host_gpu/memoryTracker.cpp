@@ -63,6 +63,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	g_cpu_dirty_generation.fetch_add(1, std::memory_order_release); // every page starts modified
 	return ptr;
 }
 

@@ -78,6 +78,10 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Bumped whenever pages become CPU-modified (a region also starts out fully modified), so a
+// caller that has uploaded everything can tell nothing new needs uploading (PrepareBda).
+inline std::atomic<uint64_t> g_cpu_dirty_generation {0};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -118,6 +122,11 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			// After the bits: a sync that read the generation earlier either uploads these pages or
+			// sees the new generation next time.
+			g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();

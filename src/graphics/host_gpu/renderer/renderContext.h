@@ -81,6 +81,12 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	// PrepareBda: generations seen by the last full synchronization (see PrepareBda).
+	uint64_t                  m_mapped_generation = 0;
+	bool                      m_bda_synced        = false;
+	uint64_t                  m_bda_cpu_dirty     = 0;
+	uint64_t                  m_bda_buffers       = 0;
+	uint64_t                  m_bda_mapped        = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

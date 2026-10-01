@@ -128,6 +128,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapped_generation++;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -146,6 +147,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapped_generation++;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -158,9 +160,26 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// A full pass uploads every CPU-modified page of every buffer and leaves them clean and
+	// write-protected. Another pass only has work when pages became CPU-modified, buffers came or
+	// went, or the mapping changed since; generations read before the pass keep a concurrent
+	// change from being missed. KYTY_BDA_SYNC_ALWAYS=1 synchronizes on every call.
+	static const bool always = std::getenv("KYTY_BDA_SYNC_ALWAYS") != nullptr;
+	const auto        cpu_dirty = g_cpu_dirty_generation.load(std::memory_order_acquire);
+	const auto        buffers   = m_buffer_cache.BufferSetGeneration();
+	if (always || !m_bda_synced || cpu_dirty != m_bda_cpu_dirty || buffers != m_bda_buffers ||
+	    m_mapped_generation != m_bda_mapped) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_synced    = true;
+		m_bda_cpu_dirty = cpu_dirty;
+		m_bda_buffers   = buffers;
+		m_bda_mapped    = m_mapped_generation;
+		Common::FrameStats::g_bda_full_syncs.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		Common::FrameStats::g_bda_skipped_syncs.fetch_add(1, std::memory_order_relaxed);
+	}
 	m_fault_process_pending = true;
 }
 
