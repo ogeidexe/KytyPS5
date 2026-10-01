@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -64,7 +65,13 @@ void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t va
 	// hang the OS reset), which froze the emulator for good. Wait in slices instead: while the GPU
 	// is alive this is the same wait, and a lost device is noticed and reported.
 	const bool     diagnostics = Common::GpuWaitDiagnostics::Enabled();
-	const uint64_t slice_ns    = diagnostics ? 2'000'000'000ull : 1'000'000'000ull;
+	// KYTY_GPU_WAIT_SLICE_MS (diagnostics): report stalls shorter than the default 2 s slice too.
+	static const uint64_t diagnostic_slice_ns = [] {
+		const char* value = std::getenv("KYTY_GPU_WAIT_SLICE_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000ull
+		                        : 2'000'000'000ull;
+	}();
+	const uint64_t slice_ns    = diagnostics ? diagnostic_slice_ns : 1'000'000'000ull;
 	vk::Result     result      = vk::Result::eSuccess;
 	bool           stalled     = false;
 	const auto     wait_start  = std::chrono::steady_clock::now();
@@ -82,10 +89,10 @@ void WaitTimeline(GraphicContext& graphics, vk::Semaphore semaphore, uint64_t va
 		if (diagnostics) {
 			char header[256];
 			std::snprintf(header, sizeof(header),
-			              "timeline %p (%s): waiting %u s for value %llu, GPU reached %llu, next "
+			              "timeline %p (%s): waiting %u ms for value %llu, GPU reached %llu, next "
 			              "unsubmitted %llu",
 			              static_cast<void*>(static_cast<VkSemaphore>(semaphore)), what,
-			              static_cast<unsigned>(slice * slice_ns / 1'000'000'000ull),
+			              static_cast<unsigned>(slice * slice_ns / 1'000'000ull),
 			              static_cast<unsigned long long>(value),
 			              static_cast<unsigned long long>(counter),
 			              static_cast<unsigned long long>(next_unsubmitted));
