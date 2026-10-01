@@ -279,6 +279,8 @@ bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		submit_info.pCommandBuffers      = &command;
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores    = &m_readback_semaphore;
+		// The copies read what earlier GPU work wrote: that work must be in the queue first.
+		CommandScheduler::SubmitOrdering(nullptr);
 		{
 			Common::LockGuard lock(m_graphics.queue_mutex);
 			const auto        result = m_graphics.queue.submit(1, &submit_info, nullptr);

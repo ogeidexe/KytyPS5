@@ -4,6 +4,8 @@
 #include "common/gpuWaitDiagnostics.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -13,6 +15,8 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+// The scheduler whose submissions are made by its recording thread (at most one: the renderer's).
+static std::atomic<CommandScheduler*> g_async_scheduler {nullptr};
 
 namespace {
 
@@ -95,13 +99,140 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool asynchronous)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_asynchronous(asynchronous) {
+	if (m_asynchronous) {
+		CommandScheduler* expected = nullptr;
+		EXIT_IF(!g_async_scheduler.compare_exchange_strong(expected, this));
+		m_recording_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	StopRecordingThread();
+}
+
+void CommandScheduler::StopRecordingThread() {
+	if (!m_recording_thread.joinable()) {
+		return;
+	}
+	WaitRecordingIdle();
+	{
+		// Under the mutex, so the recording thread cannot miss the stop between its check and
+		// its wait.
+		std::lock_guard lock(m_batch_mutex);
+		m_recording_thread.request_stop();
+	}
+	m_batch_available.notify_all();
+	m_recording_thread.join();
+	CommandScheduler* expected = this;
+	g_async_scheduler.compare_exchange_strong(expected, nullptr);
+}
+
+void CommandScheduler::WaitRecordingIdle() {
+	if (!m_asynchronous) {
+		return;
+	}
+	std::unique_lock lock(m_batch_mutex);
+	m_batch_submitted.wait(lock, [this] { return m_submitted_tick >= m_last_queued_tick; });
+}
+
+void CommandScheduler::SubmitOrdering(const CommandScheduler* submitter) {
+	auto* async = g_async_scheduler.load(std::memory_order_acquire);
+	if (async != nullptr && async != submitter) {
+		async->WaitRecordingIdle();
+	}
+}
+
+std::unique_ptr<CommandStream> CommandScheduler::AcquireStream() {
+	{
+		std::lock_guard lock(m_batch_mutex);
+		if (!m_free_streams.empty()) {
+			auto stream = std::move(m_free_streams.back());
+			m_free_streams.pop_back();
+			return stream;
+		}
+	}
+	return std::make_unique<CommandStream>();
+}
+
+void CommandScheduler::RecordingThread(std::stop_token stop) {
+	Common::Thread::SetHostName("Thread_GpuRecord");
+	KYTY_PROFILER_THREAD("Thread_GpuRecord");
+	for (;;) {
+		RecordedBatch* batch = nullptr;
+		{
+			std::unique_lock lock(m_batch_mutex);
+			m_batch_available.wait(lock,
+			                       [this, &stop] { return stop.stop_requested() || !m_batches.empty(); });
+			if (m_batches.empty()) {
+				return; // stop requested with nothing left to submit
+			}
+			batch = &m_batches.front();
+		}
+		if (!RecordBatch(*batch, stop)) {
+			return; // stopped before the GPU thread closed the batch: nothing to submit
+		}
+		{
+			std::lock_guard lock(m_batch_mutex);
+			m_submitted_tick = batch->tick;
+			batch->stream->Clear();
+			m_free_streams.push_back(std::move(batch->stream));
+			m_batches.pop_front();
+		}
+		m_batch_submitted.notify_all();
+	}
+}
+
+bool CommandScheduler::RecordBatch(RecordedBatch& batch, const std::stop_token& stop) {
+	auto&      stream = *batch.stream;
+	const auto buffer = m_command_pool.Commit();
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(buffer.begin(&begin_info) != vk::Result::eSuccess);
+	for (;;) {
+		bool closed = false;
+		{
+			std::unique_lock lock(m_batch_mutex);
+			m_batch_available.wait(lock, [&] {
+				return batch.closed || stream.HasPublishedWork() || stop.stop_requested();
+			});
+			closed = batch.closed;
+			if (!closed && !stream.HasPublishedWork()) {
+				break; // stop requested
+			}
+		}
+		// Submit() publishes everything before closing, so this drains a closed batch.
+		stream.ExecutePublished(buffer);
+		if (closed) {
+			EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+			QueueSubmit(buffer, batch.submit, batch.tick, batch.debug_op, batch.debug_submit,
+			            batch.debug_args, batch.debug_arg4);
+			return true;
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+	return false;
+}
+
+void CommandScheduler::PublishCommands() {
+	// Often enough that little is left to replay when the GPU thread submits and waits, rarely
+	// enough that waking the recording thread stays cheap.
+	constexpr size_t PublishThreshold = 64;
+	auto*            stream           = m_command.m_stream;
+	if (stream == nullptr || stream->UnpublishedCount() < PublishThreshold) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_batch_mutex);
+		stream->Publish();
+	}
+	m_batch_available.notify_one();
 }
 
 void CommandScheduler::Shutdown() {
@@ -127,6 +258,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
+	WaitRecordingIdle();
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
@@ -154,6 +286,9 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
+	} else if (m_asynchronous) {
+		// Commands of the previous draw are complete: let the recording thread replay them.
+		PublishCommands();
 	}
 }
 
@@ -348,7 +483,19 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	if (m_asynchronous) {
+		auto stream        = AcquireStream();
+		m_command.m_stream = stream.get();
+		{
+			std::lock_guard lock(m_batch_mutex);
+			auto&           batch = m_batches.emplace_back();
+			batch.stream          = std::move(stream);
+			m_open_batch          = &batch;
+		}
+		m_batch_available.notify_one();
+	} else {
+		m_command.m_buffer = m_command_pool.Commit();
+	}
 	m_command.Begin();
 	return m_command;
 }
@@ -359,16 +506,58 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_graphics.queue == nullptr);
+	if (m_asynchronous) {
+		// The recording thread submits batches in the order they were opened; ticks are handed
+		// out in the same order, so the timeline stays monotonic.
+		EXIT_IF(m_open_batch == nullptr || m_open_batch->stream.get() != m_command.m_stream);
+		const auto tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), tick);
+		{
+			std::lock_guard lock(m_batch_mutex);
+			auto&           batch = *m_open_batch;
+			batch.stream->Publish();
+			batch.submit        = submit;
+			batch.tick          = tick;
+			batch.debug_op      = m_command.m_debug_op;
+			batch.debug_submit  = m_command.m_debug_submit_id;
+			batch.debug_args[0] = m_command.m_debug_arg0;
+			batch.debug_args[1] = m_command.m_debug_arg1;
+			batch.debug_args[2] = m_command.m_debug_arg2;
+			batch.debug_args[3] = m_command.m_debug_arg3;
+			batch.debug_arg4    = m_command.m_debug_arg4;
+			batch.closed        = true;
+			m_last_queued_tick  = tick;
+		}
+		m_batch_available.notify_one();
+		m_open_batch       = nullptr;
+		m_command.m_stream = nullptr;
+		return tick;
+	}
 
+	SubmitOrdering(this);
+	const auto buffer = m_command.m_buffer;
+	uint64_t   tick   = 0;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		tick = m_master.NextTick();
+	}
+	submit.AddSignal(m_master.Handle(), tick);
+	const uint32_t debug_args[4] = {m_command.m_debug_arg0, m_command.m_debug_arg1,
+	                                m_command.m_debug_arg2, m_command.m_debug_arg3};
+	QueueSubmit(buffer, submit, tick, m_command.m_debug_op, m_command.m_debug_submit_id,
+	            debug_args, m_command.m_debug_arg4);
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+                                   uint32_t debug_op, uint64_t debug_submit,
+                                   const uint32_t* debug_args, uint64_t debug_arg4) {
+	auto&      graphics = m_graphics;
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -395,15 +584,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		if (result == vk::Result::eErrorDeviceLost) {
 			GpuCheckpoints::ReportDeviceLost(graphics.queue);
 		}
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, debug_op, debug_submit, debug_args[0],
+		                  debug_args[1], debug_args[2], debug_args[3], debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	m_command.m_buffer = nullptr;
-	return tick;
 }
 
 void CommandScheduler::BeginNext() {

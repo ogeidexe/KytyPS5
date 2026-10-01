@@ -7,6 +7,7 @@
 // work that hung it. Without the extension or the switch every call here is a no-op.
 
 #include "common/gpuWaitDiagnostics.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageHistory.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -115,7 +116,7 @@ inline void Initialize(vk::Device device, vk::PhysicalDevice physical_device) {
 	}
 }
 
-inline void Mark(vk::CommandBuffer command, const Record& record) {
+inline void Mark(const CommandRecorder& command, const Record& record) {
 	auto& s = GetState();
 	if (!s.records || !command) {
 		return;
@@ -125,16 +126,20 @@ inline void Mark(vk::CommandBuffer command, const Record& record) {
 		index = 1; // a null marker is indistinguishable from none
 	}
 	s.records[index] = record;
-	if (s.set_checkpoint != nullptr) {
-		s.set_checkpoint(static_cast<VkCommandBuffer>(command),
-		                 reinterpret_cast<void*>(static_cast<uintptr_t>(index)));
-	}
-	if (s.write_marker != nullptr) {
-		s.write_marker(static_cast<VkCommandBuffer>(command), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		               s.marker_buffer, 0, index);
-		s.write_marker(static_cast<VkCommandBuffer>(command), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		               s.marker_buffer, 4, index);
-	}
+	// The record is filed now (GPU thread order); the marker commands go where the draw does.
+	command.Run([index](vk::CommandBuffer native) {
+		auto& state = GetState();
+		if (state.set_checkpoint != nullptr) {
+			state.set_checkpoint(static_cast<VkCommandBuffer>(native),
+			                     reinterpret_cast<void*>(static_cast<uintptr_t>(index)));
+		}
+		if (state.write_marker != nullptr) {
+			state.write_marker(static_cast<VkCommandBuffer>(native),
+			                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, state.marker_buffer, 0, index);
+			state.write_marker(static_cast<VkCommandBuffer>(native),
+			                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state.marker_buffer, 4, index);
+		}
+	});
 }
 
 // KYTY_GPU_MARKERS only: while a wait for the GPU is stalled (or right after), the work between

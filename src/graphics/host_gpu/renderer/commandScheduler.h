@@ -6,7 +6,10 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -18,7 +21,10 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	// asynchronous: commands are recorded into streams that a recording thread replays into
+	// Vulkan command buffers and submits, in order, so the caller's thread does not pay for the
+	// driver's recording and submission (opt-in: KYTY_ASYNC_RECORD=1).
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool asynchronous = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -52,6 +58,13 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	[[nodiscard]] bool             Asynchronous() const noexcept { return m_asynchronous; }
+	// Returns once the recording thread has submitted every batch queued so far. Anything else
+	// that submits to the queue must call this first (see SubmitOrdering), so its work cannot
+	// precede, or wait on, work still queued here.
+	void WaitRecordingIdle();
+	// Called by every queue submission that does not go through an asynchronous scheduler.
+	static void SubmitOrdering(const CommandScheduler* submitter);
 
 private:
 	class CommandPool {
@@ -82,9 +95,29 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// Queued when its stream is opened: the recording thread replays the stream while the GPU
+	// thread is still recording it, and submits once Submit() has closed it.
+	struct RecordedBatch {
+		std::unique_ptr<CommandStream> stream;
+		bool                           closed = false; // the fields below are set
+		SubmitInfo                     submit;
+		uint64_t                       tick         = 0;
+		uint32_t                       debug_op     = 0;
+		uint64_t                       debug_submit = 0;
+		uint32_t                       debug_args[4] {};
+		uint64_t                       debug_arg4   = 0;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void RecordingThread(std::stop_token stop);
+	bool RecordBatch(RecordedBatch& batch, const std::stop_token& stop);
+	void PublishCommands();
+	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick, uint32_t debug_op,
+	                 uint64_t debug_submit, const uint32_t* debug_args, uint64_t debug_arg4);
+	std::unique_ptr<CommandStream> AcquireStream();
+	void                           StopRecordingThread();
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -99,6 +132,20 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+
+	// Asynchronous recording (GPU thread produces batches, the recording thread consumes them).
+	bool                                        m_asynchronous = false;
+	// Elements stay in place until the recording thread has submitted them (deque references
+	// survive push_back and pop_front), so the GPU thread can close its open batch in place.
+	std::deque<RecordedBatch>                   m_batches;
+	RecordedBatch*                              m_open_batch = nullptr; // GPU thread
+	std::vector<std::unique_ptr<CommandStream>> m_free_streams;
+	std::mutex                                  m_batch_mutex;
+	std::condition_variable                     m_batch_available;
+	std::condition_variable                     m_batch_submitted;
+	uint64_t                                    m_last_queued_tick = 0;
+	uint64_t                                    m_submitted_tick   = 0;
+	std::jthread                                m_recording_thread;
 };
 
 } // namespace Libs::Graphics

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -113,7 +114,11 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Records into the Vulkan command buffer directly, or into the stream the recording thread
+	// replays (CommandScheduler with asynchronous recording).
+	[[nodiscard]] CommandRecorder   Handle() const;
+	// The Vulkan command buffer itself; only for immediate (synchronous) schedulers.
+	[[nodiscard]] vk::CommandBuffer ImmediateHandle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -133,7 +138,8 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer          = nullptr;
+	vk::CommandBuffer   m_buffer          = nullptr; // immediate recording
+	CommandStream*      m_stream          = nullptr; // deferred recording
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;

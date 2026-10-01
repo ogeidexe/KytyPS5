@@ -21,31 +21,38 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return m_buffer == nullptr && m_stream == nullptr;
 }
 
-vk::CommandBuffer CommandBuffer::Handle() const {
+CommandRecorder CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
+}
+
+vk::CommandBuffer CommandBuffer::ImmediateHandle() const {
+	EXIT_IF(m_buffer == nullptr);
 	return m_buffer;
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
-
+	if (m_stream != nullptr) {
+		return; // the recording thread begins the Vulkan command buffer it replays into
+	}
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 
-	auto result = buffer.begin(&begin_info);
+	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
-
-	auto result = buffer.end();
+	if (m_stream != nullptr) {
+		return;
+	}
+	auto result = m_buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
