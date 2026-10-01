@@ -563,6 +563,10 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// PassThroughUserData of every descriptor dword, per source (filled on first use; it depends
+	// on the plan only, and EvaluateDescriptor needs it for every dword of every evaluation).
+	mutable std::vector<std::array<uint32_t, 8>> pass_through_dwords;
+	mutable std::vector<uint8_t>                 pass_through_ready;
 };
 
 struct Program: ResourcePlan {

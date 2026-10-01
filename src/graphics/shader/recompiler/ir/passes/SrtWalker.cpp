@@ -840,6 +840,19 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
+	if (m_program.pass_through_ready.size() != m_program.descriptor_sources.size()) {
+		m_program.pass_through_ready.assign(m_program.descriptor_sources.size(), 0u);
+		m_program.pass_through_dwords.resize(m_program.descriptor_sources.size());
+	}
+	auto& pass_through = m_program.pass_through_dwords[source];
+	if (m_program.pass_through_ready[source] == 0u) {
+		pass_through.fill(UINT32_MAX);
+		for (uint32_t index = 0; index < descriptor.dwords.size() && index < descriptor.dword_count;
+		     ++index) {
+			pass_through[index] = PassThroughUserData(m_program, descriptor.dwords[index]);
+		}
+		m_program.pass_through_ready[source] = 1u;
+	}
 	result = {};
 	result.dword_count = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dwords.size() && index < descriptor.dword_count;
@@ -849,8 +862,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		// user data read: the word reaches the output verbatim and influences nothing else here,
 		// so a caller can substitute it (see PassThroughUserData). Any other use of the same word
 		// still evaluates normally and is reported.
-		if (const auto k = PassThroughUserData(m_program, descriptor.dwords[index]);
-		    k != UINT32_MAX) {
+		if (const auto k = pass_through[index]; k != UINT32_MAX) {
 			if (k >= m_runtime.user_data.size()) {
 				return false;
 			}
