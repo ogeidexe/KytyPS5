@@ -162,6 +162,10 @@ private:
 	Header*                                                  m_executed = nullptr; // executing thread
 };
 
+// Commands that read or write memory (draws, dispatches, copies, clears, render pass begins)
+// recorded by this thread. A barrier with none recorded since the previous one orders nothing new.
+inline thread_local uint64_t g_recorded_work = 0;
+
 // What renderer code records commands through. Immediate recorders forward to a Vulkan command
 // buffer at once; deferred ones copy the call (and every array it references) into a stream for
 // the recording thread. The method names and forms follow vk::CommandBuffer.
@@ -256,6 +260,7 @@ public:
 	}
 
 	void beginRendering(const vk::RenderingInfo* info) const {
+		++g_recorded_work;
 		if (m_stream == nullptr) {
 			m_immediate.beginRendering(info);
 			return;
@@ -277,29 +282,36 @@ public:
 
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.draw(vertices, instances, first_vertex, first_instance); });
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index,
 	                 int32_t vertex_offset, uint32_t first_instance) const {
 		Run([=](vk::CommandBuffer c) {
+		++g_recorded_work;
 			c.drawIndexed(indices, instances, first_index, vertex_offset, first_instance);
 		});
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.drawIndirect(buffer, offset, count, stride); });
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.drawIndexedIndirect(buffer, offset, count, stride); });
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.drawMeshTasksEXT(x, y, z); });
 	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.dispatchIndirect(buffer, offset); });
 	}
 
@@ -386,27 +398,32 @@ public:
 
 	void copyBuffer(vk::Buffer src, vk::Buffer dst, uint32_t count,
 	                const vk::BufferCopy* regions) const {
+		++g_recorded_work;
 		const auto* r = Persist(regions, count);
 		Run([=](vk::CommandBuffer c) { c.copyBuffer(src, dst, count, r); });
 	}
 	void copyImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
 	               vk::ImageLayout dst_layout, uint32_t count, const vk::ImageCopy* regions) const {
+		++g_recorded_work;
 		const auto* r = Persist(regions, count);
 		Run([=](vk::CommandBuffer c) { c.copyImage(src, src_layout, dst, dst_layout, count, r); });
 	}
 	void copyBufferToImage(vk::Buffer src, vk::Image dst, vk::ImageLayout layout, uint32_t count,
 	                       const vk::BufferImageCopy* regions) const {
+		++g_recorded_work;
 		const auto* r = Persist(regions, count);
 		Run([=](vk::CommandBuffer c) { c.copyBufferToImage(src, dst, layout, count, r); });
 	}
 	void copyImageToBuffer(vk::Image src, vk::ImageLayout layout, vk::Buffer dst, uint32_t count,
 	                       const vk::BufferImageCopy* regions) const {
+		++g_recorded_work;
 		const auto* r = Persist(regions, count);
 		Run([=](vk::CommandBuffer c) { c.copyImageToBuffer(src, layout, dst, count, r); });
 	}
 	void blitImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
 	               vk::ImageLayout dst_layout, uint32_t count, const vk::ImageBlit* regions,
 	               vk::Filter filter) const {
+		++g_recorded_work;
 		const auto* r = Persist(regions, count);
 		Run([=](vk::CommandBuffer c) {
 			c.blitImage(src, src_layout, dst, dst_layout, count, r, filter);
@@ -453,6 +470,7 @@ public:
 	void resolveImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
 	                  vk::ImageLayout dst_layout,
 	                  vk::ArrayProxy<const vk::ImageResolve> const& regions) const {
+		++g_recorded_work;
 		const auto  count = static_cast<uint32_t>(regions.size());
 		const auto* r     = Persist(regions.data(), count);
 		Run([=](vk::CommandBuffer c) {
@@ -461,6 +479,7 @@ public:
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		++g_recorded_work;
 		const auto* k = Persist(color, 1);
 		const auto* r = Persist(ranges, count);
 		Run([=](vk::CommandBuffer c) { c.clearColorImage(image, layout, k, count, r); });
@@ -471,6 +490,7 @@ public:
 	}
 	void clearAttachments(uint32_t attachment_count, const vk::ClearAttachment* attachments,
 	                      uint32_t rect_count, const vk::ClearRect* rects) const {
+		++g_recorded_work;
 		const auto* a = Persist(attachments, attachment_count);
 		const auto* r = Persist(rects, rect_count);
 		Run([=](vk::CommandBuffer c) { c.clearAttachments(attachment_count, a, rect_count, r); });
@@ -478,16 +498,19 @@ public:
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
 	                            const vk::ImageSubresourceRange* ranges) const {
+		++g_recorded_work;
 		const auto* k = Persist(value, 1);
 		const auto* r = Persist(ranges, count);
 		Run([=](vk::CommandBuffer c) { c.clearDepthStencilImage(image, layout, k, count, r); });
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t data) const {
+		++g_recorded_work;
 		Run([=](vk::CommandBuffer c) { c.fillBuffer(buffer, offset, size, data); });
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		++g_recorded_work;
 		const auto* d = Persist(static_cast<const std::byte*>(data), static_cast<size_t>(size));
 		Run([=](vk::CommandBuffer c) { c.updateBuffer(buffer, offset, size, d); });
 	}

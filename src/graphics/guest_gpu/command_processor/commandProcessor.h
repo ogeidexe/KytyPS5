@@ -211,6 +211,9 @@ private:
 	bool      m_predicate_skip              = false;
 	uint32_t  m_deferred_event_flushes      = 0;
 	uint64_t  m_deferred_event_since        = 0;
+	// EmitGlobalBarrier: command buffer (tick) and recorded-work count at the last guest barrier.
+	uint64_t  m_barrier_tick                = 0;
+	uint64_t  m_barrier_work                = UINT64_MAX;
 };
 
 } // namespace Libs::Graphics

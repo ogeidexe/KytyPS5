@@ -9,6 +9,7 @@
 #include "common/timer.h"
 
 #include <cstdlib>
+#include <cstring>
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -1553,6 +1554,20 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 
+	// A barrier orders the work recorded before it against the work after it. Guest flush and
+	// invalidate events often come in runs; when the open command buffer has recorded no work
+	// since the previous guest barrier, another one orders nothing new.
+	// KYTY_ELIDE_GUEST_BARRIERS=0 emits every one.
+	static const bool elide = [] {
+		const char* value = std::getenv("KYTY_ELIDE_GUEST_BARRIERS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	const auto tick = GetScheduler().CurrentTick();
+	if (elide && m_barrier_tick == tick && m_barrier_work == g_recorded_work) {
+		Common::FrameStats::g_barriers_guest_elided.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
@@ -1565,6 +1580,8 @@ void CommandProcessor::EmitGlobalBarrier() {
 	Common::FrameStats::g_barriers_guest_global.fetch_add(1, std::memory_order_relaxed);
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	m_barrier_tick = tick;
+	m_barrier_work = g_recorded_work;
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
