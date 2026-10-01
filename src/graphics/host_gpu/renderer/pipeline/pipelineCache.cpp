@@ -28,6 +28,7 @@
 #include <bit>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,8 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -565,10 +568,181 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// KYTY_SRT_STATS=1 (diagnostic): SRT cache outcomes per program, printed every 10 s, to see
+	// which programs force full evaluations and which user data words vary between their misses.
+	struct SrtProgramStats {
+		uint64_t                     lookups = 0, hits = 0, miss_empty = 0, miss_evict = 0,
+		                             miss_memory = 0;
+		std::array<uint64_t, 64>     changed_words {};
+		std::vector<uint32_t>        last_miss_user_data;
+		std::unordered_set<uint64_t> keys;
+		std::unordered_set<uint64_t> flat_contents; // flattened SRT words of evaluated misses
+		std::unordered_set<uint64_t> outputs;       // full outputs of evaluated misses
+		uint64_t                     mask = 0;
+		size_t                       user_data_size = 0;
+	};
+
+	static std::unordered_map<uint64_t, SrtProgramStats>& SrtStatsMap() {
+		static std::unordered_map<uint64_t, SrtProgramStats> stats;
+		return stats;
+	}
+
+	// After an evaluated miss: how many different table contents and outputs a program really has.
+	static void RecordSrtOutputs(uint64_t program_hash, const SourceEntry& entry) {
+		static const bool enabled = std::getenv("KYTY_SRT_STATS") != nullptr;
+		if (!enabled) {
+			return;
+		}
+		auto&       s   = SrtStatsMap()[program_hash];
+		const auto& res = entry.resources;
+		const auto  flat =
+		    XXH3_64bits(res.flattened_srt.data(), res.flattened_srt.size() * sizeof(uint32_t));
+		if (s.flat_contents.size() < 65536) {
+			s.flat_contents.insert(flat);
+		}
+		if (s.outputs.size() < 65536) {
+			uint64_t   h   = flat;
+			const auto mix = [&](const std::vector<ShaderRecompiler::IR::DescriptorValue>& values) {
+				for (const auto& d: values) {
+					h = XXH3_64bits_withSeed(d.dwords.data(), d.dword_count * sizeof(uint32_t), h);
+				}
+			};
+			mix(res.buffers);
+			mix(res.images);
+			mix(res.samplers);
+			s.outputs.insert(h);
+		}
+	}
+
+	static void RecordSrtStats(uint64_t program_hash, const SourceEntry& entry,
+	                           const SrtTrace& trace, uint64_t key_hash,
+	                           std::span<const uint32_t> user_data, int outcome) {
+		static const bool enabled = std::getenv("KYTY_SRT_STATS") != nullptr;
+		if (!enabled) {
+			return;
+		}
+		auto&       stats      = SrtStatsMap();
+		static auto last_print = std::chrono::steady_clock::now();
+		auto&       s          = stats[program_hash];
+		s.lookups++;
+		s.mask           = entry.srt_user_data_mask;
+		s.user_data_size = user_data.size();
+		if (s.keys.size() < 65536) {
+			s.keys.insert(key_hash);
+		}
+		if (outcome == 0) {
+			s.hits++;
+		} else {
+			if (outcome == 1) {
+				(trace.valid ? s.miss_evict : s.miss_empty)++;
+			} else {
+				s.miss_memory++;
+			}
+			for (size_t i = 0; i < user_data.size() && i < 64; i++) {
+				if (i < s.last_miss_user_data.size() && s.last_miss_user_data[i] != user_data[i]) {
+					s.changed_words[i]++;
+				}
+			}
+			s.last_miss_user_data.assign(user_data.begin(), user_data.end());
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_print < std::chrono::seconds(10)) {
+			return;
+		}
+		last_print = now;
+		std::vector<std::pair<uint64_t, const SrtProgramStats*>> order;
+		uint64_t total_lookups = 0, total_misses = 0;
+		for (const auto& [hash, value]: stats) {
+			order.emplace_back(hash, &value);
+			total_lookups += value.lookups;
+			total_misses += value.lookups - value.hits;
+		}
+		std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+			return a.second->lookups - a.second->hits > b.second->lookups - b.second->hits;
+		});
+		std::printf("[srt-stats] %zu programs, %" PRIu64 " lookups, %" PRIu64 " misses\n",
+		            stats.size(), total_lookups, total_misses);
+		for (size_t i = 0; i < order.size() && i < 12; i++) {
+			const auto& v = *order[i].second;
+			std::string changed;
+			std::array<uint32_t, 64> idx {};
+			for (uint32_t w = 0; w < 64; w++) {
+				idx[w] = w;
+			}
+			std::sort(idx.begin(), idx.end(),
+			          [&](uint32_t a, uint32_t b) { return v.changed_words[a] > v.changed_words[b]; });
+			for (int k = 0; k < 5 && v.changed_words[idx[k]] != 0; k++) {
+				changed += fmt::format(" w{}:{}", idx[k], v.changed_words[idx[k]]);
+			}
+			std::printf("[srt-stats]   %016" PRIx64 " lookups %" PRIu64 " hit %.0f%% empty %" PRIu64
+			            " evict %" PRIu64 " memory %" PRIu64 " keys %zu flat %zu outputs %zu"
+			            " mask %d/%zu changed:%s\n",
+			            order[i].first, v.lookups, 100.0 * static_cast<double>(v.hits) / v.lookups,
+			            v.miss_empty, v.miss_evict, v.miss_memory, v.keys.size(),
+			            v.flat_contents.size(), v.outputs.size(),
+			            std::popcount(v.mask), v.user_data_size, changed.c_str());
+		}
+		std::fflush(stdout);
+	}
+
+	// KYTY_SRT_DUMP=<program hash>[,...] (diagnostic): the expressions a program's descriptors, SRT
+	// reads and resource control flow evaluate, printed once.
+	static void DumpSrtPlan(uint64_t program_hash, const SourceEntry& entry) {
+		static const std::string wanted = [] {
+			const char* value = std::getenv("KYTY_SRT_DUMP");
+			return std::string(value != nullptr ? value : "");
+		}();
+		if (wanted.empty() || wanted.find(fmt::format("{:016x}", program_hash)) == std::string::npos) {
+			return;
+		}
+		static std::unordered_set<uint64_t> dumped;
+		if (!dumped.insert(program_hash).second) {
+			return;
+		}
+		using ShaderRecompiler::IR::DescribeSrtValue;
+		const auto& plan = entry.resource_plan;
+		std::printf("[srt-dump] %016" PRIx64 " user_data_base=%u sources=%zu srt_reads=%zu "
+		            "control_flow=%zu buffers=%zu images=%zu samplers=%zu\n",
+		            program_hash, plan.user_data_base, plan.descriptor_sources.size(),
+		            plan.srt_reads.size(), plan.control_flow.size(), plan.info.buffers.size(),
+		            plan.info.images.size(), plan.info.samplers.size());
+		const auto source = [&](const char* kind, size_t index, uint32_t s) {
+			if (s >= plan.descriptor_sources.size()) {
+				return;
+			}
+			const auto& d = plan.descriptor_sources[s];
+			for (uint32_t j = 0; j < d.dword_count && j < d.dwords.size(); j++) {
+				std::printf("[srt-dump]   %s %zu (source %u) dw%u = %s\n", kind, index, s, j,
+				            DescribeSrtValue(plan, d.dwords[j]).c_str());
+			}
+		};
+		for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+			source("buffer", i, plan.info.buffers[i].source);
+		}
+		for (size_t i = 0; i < plan.info.images.size(); i++) {
+			source("image", i, plan.info.images[i].source);
+		}
+		for (size_t i = 0; i < plan.info.samplers.size(); i++) {
+			source("sampler", i, plan.info.samplers[i].source);
+		}
+		for (size_t i = 0; i < plan.srt_reads.size(); i++) {
+			std::printf("[srt-dump]   srt_read %zu (flat %u) = %s\n", i, plan.srt_reads[i].flat_offset,
+			            DescribeSrtValue(plan, plan.srt_reads[i].value).c_str());
+		}
+		for (size_t i = 0; i < plan.control_flow.size(); i++) {
+			if (!plan.control_flow[i].condition.IsEmpty()) {
+				std::printf("[srt-dump]   block %zu condition = %s\n", i,
+				            DescribeSrtValue(plan, plan.control_flow[i].condition).c_str());
+			}
+		}
+		std::fflush(stdout);
+	}
+
 	// MaterializeResources for a draw, skipped when the entry's dependency trace shows the previous
 	// evaluation (whose outputs are still in the entry) would repeat exactly.
 	static void Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                        uint64_t program_hash) {
+		DumpSrtPlan(program_hash, entry);
 		constexpr uint32_t Slots   = 256;
 		const bool         enabled = SrtCacheEnabled() && !entry.srt_disabled;
 		SrtTrace*          trace   = nullptr;
@@ -593,10 +767,13 @@ struct PipelineCache::ProgramCache {
 			    SameSrtInputs(trace->user_data, runtime.user_data, entry.srt_user_data_mask);
 			if (!same_inputs) {
 				Common::FrameStats::g_srt_miss_inputs.fetch_add(1, std::memory_order_relaxed);
+				RecordSrtStats(program_hash, entry, *trace, key_hash, runtime.user_data, 1);
 			} else if (!SrtTraceStillValid(*trace)) {
 				Common::FrameStats::g_srt_miss_memory.fetch_add(1, std::memory_order_relaxed);
+				RecordSrtStats(program_hash, entry, *trace, key_hash, runtime.user_data, 2);
 			} else {
 				Common::FrameStats::g_srt_hits.fetch_add(1, std::memory_order_relaxed);
+				RecordSrtStats(program_hash, entry, *trace, key_hash, runtime.user_data, 0);
 				Common::FrameStats::g_srt_checked_reads.fetch_add(trace->records.size(),
 				                                                  std::memory_order_relaxed);
 				bool substituted = false;
@@ -673,6 +850,7 @@ struct PipelineCache::ProgramCache {
 		    trace != nullptr && entry.srt_rematerialize ? &trace->raw : nullptr);
 		g_srt_recording = nullptr;
 		EXIT_IF(!ok);
+		RecordSrtOutputs(program_hash, entry);
 		entry.srt_current = UINT32_MAX;
 		if (trace != nullptr) {
 			if ((g_srt_user_data_read & ~entry.srt_user_data_mask) != 0) {

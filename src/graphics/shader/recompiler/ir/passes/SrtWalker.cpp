@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <fmt/format.h>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -945,6 +946,55 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 	}
 	return true;
+}
+
+std::string DescribeSrtValue(const ResourcePlan& program, Value value, int max_depth) {
+	value = value.Resolve();
+	if (value.IsEmpty()) {
+		return "<empty>";
+	}
+	if (value.IsImmediate()) {
+		switch (value.GetType()) {
+			case Type::U1: return value.U1() ? "true" : "false";
+			case Type::U8: return fmt::format("{:#x}", value.U8());
+			case Type::U16: return fmt::format("{:#x}", value.U16());
+			case Type::U32: return fmt::format("{:#x}", value.U32());
+			case Type::U64: return fmt::format("{:#x}ull", value.U64());
+			case Type::F32: return fmt::format("{}f", value.F32Value());
+			case Type::ScalarReg: return fmt::format("s{}", RegIndex(value.ScalarRegister()));
+			default: return "<imm>";
+		}
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return "<?>";
+	}
+	if (inst->GetOpcode() == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+	    inst->Arg(0).GetType() == Type::ScalarReg) {
+		const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+		return reg >= program.user_data_base ? fmt::format("ud[{}]", reg - program.user_data_base)
+		                                     : fmt::format("s{}", reg);
+	}
+	std::string text(ValueOpcodeName(inst->GetOpcode()));
+	if (max_depth <= 0) {
+		return text + "(...)";
+	}
+	if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+	    inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+		const auto index = inst->Flags<MemoryFlags>().index;
+		if (index < program.memory_info.size()) {
+			text += fmt::format("[mem{} +{:#x}]", index,
+			                    static_cast<int32_t>(program.memory_info[index].offset));
+		}
+	}
+	text += "(";
+	for (size_t i = 0; i < inst->NumArgs(); i++) {
+		if (i != 0) {
+			text += ", ";
+		}
+		text += DescribeSrtValue(program, inst->Arg(i), max_depth - 1);
+	}
+	return text + ")";
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {

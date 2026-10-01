@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -36,6 +37,10 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 // The user data index a descriptor dword copies verbatim (the value is GetUserData itself), or
 // UINT32_MAX. EvaluateDescriptor reads such dwords without reporting them to observe_user_data.
 uint32_t PassThroughUserData(const ResourcePlan& program, Value value);
+
+// Diagnostics: the expression a plan value evaluates, user data words shown as ud[N] (relative to
+// the plan's user data base), depth-limited.
+std::string DescribeSrtValue(const ResourcePlan& program, Value value, int max_depth = 10);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
