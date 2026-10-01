@@ -35541,6 +35541,13 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // The command-lane checks count the submissions each packet makes: run them without the
+  // emulator's end-of-pipe interrupt coalescing, a throughput policy (BufferFlushEvent).
+#ifdef _WIN32
+  _putenv_s("KYTY_EVENT_FLUSH_BATCH", "1");
+#else
+  setenv("KYTY_EVENT_FLUSH_BATCH", "1", 1);
+#endif
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
