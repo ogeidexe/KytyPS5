@@ -567,6 +567,23 @@ struct ResourcePlan {
 	// on the plan only, and EvaluateDescriptor needs it for every dword of every evaluation).
 	mutable std::vector<std::array<uint32_t, 8>> pass_through_dwords;
 	mutable std::vector<uint8_t>                 pass_through_ready;
+	// Per descriptor source and dword, the SRT read a dword copies as-is (ReadConst of a constant
+	// slot), or UINT32_MAX; filled with pass_through_dwords. Once the flat SRT buffer is
+	// evaluated, EvaluateDescriptor takes such dwords from it instead of walking the ReadConst.
+	mutable std::vector<std::array<uint32_t, 8>> flat_slot_dwords;
+	// SRT reads that load one word at a constant offset from the address in two user data words
+	// (the common flattened-SRT form), filled on first use. RefreshFlatBuffer evaluates these
+	// without walking their IR: same memo entry, user data, address arithmetic and memory access.
+	struct DirectSrtRead {
+		uint32_t memo_index   = UINT32_MAX; // the read's evaluation index; UINT32_MAX: not direct
+		uint32_t user_data_lo = 0;
+		uint32_t user_data_hi = 0;
+		int64_t  relative     = 0; // byte offset from the dword-aligned base
+	};
+	mutable std::vector<DirectSrtRead> direct_srt_reads;
+	mutable bool                       direct_srt_reads_ready = false;
+	// Every SRT read i fills flat slot i (so a ReadConst slot names its flat word).
+	mutable bool                       flat_slots_identity    = false;
 };
 
 struct Program: ResourcePlan {
