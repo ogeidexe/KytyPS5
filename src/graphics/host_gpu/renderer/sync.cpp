@@ -246,15 +246,14 @@ static void InterruptEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* 
                                       void*                                     trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags++;
-	triggered_event.data = reinterpret_cast<intptr_t>(trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
-	}
+	// kqueue delivers a registration at most once per retrieval: interrupts that arrive while it
+	// is still pending coalesce into it, fflags counting them (reset on retrieval) and data
+	// carrying the latest one's value. Queueing a copy per interrupt instead grew without bound
+	// (Astro Bot drains its EOP queues at ~350 events/s while ~13,000/s are raised) and handed
+	// the waiting threads a backlog of stale interrupts instead of letting them sleep.
+	event->event.fflags++;
+	event->event.data = reinterpret_cast<intptr_t>(trigger_data);
+	event->triggered  = true;
 }
 
 int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
