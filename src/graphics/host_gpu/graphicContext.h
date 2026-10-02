@@ -104,6 +104,15 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Diagnostics: VMA's memory blocks and the driver-reported usage, split into device-local
+	// heaps and the rest (host memory).
+	struct MemoryUsage {
+		uint64_t local_blocks = 0;
+		uint64_t local_usage  = 0;
+		uint64_t host_blocks  = 0;
+		uint64_t host_usage   = 0;
+	};
+	[[nodiscard]] MemoryUsage GetMemoryUsage() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 

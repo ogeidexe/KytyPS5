@@ -221,6 +221,24 @@ void GraphicContext::LogMemoryBudget() const {
 	}
 }
 
+GraphicContext::MemoryUsage GraphicContext::GetMemoryUsage() const {
+	MemoryUsage result;
+	if (allocator == nullptr) {
+		return result;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		(device_local ? result.local_blocks : result.host_blocks) +=
+		    budgets[heap].statistics.blockBytes;
+		(device_local ? result.local_usage : result.host_usage) += budgets[heap].usage;
+	}
+	return result;
+}
+
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	if (!CanReportMemoryUsage() || allocator == nullptr) {
 		return 0;

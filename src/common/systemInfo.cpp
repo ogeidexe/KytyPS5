@@ -7,6 +7,18 @@
 #include <sys/sysctl.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <intrin.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2 // GetProcessMemoryInfo from kernel32, no psapi.lib
+#endif
+#include <windows.h>
+#include <psapi.h>
+#undef GetProcessMemoryInfo // psapi.h maps it to K32GetProcessMemoryInfo
 #elif defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
 #else
@@ -59,5 +71,25 @@ SystemInfo GetSystemInfo() {
 }
 
 #endif
+
+ProcessMemoryInfo GetProcessMemoryInfo() {
+	ProcessMemoryInfo info;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PROCESS_MEMORY_COUNTERS_EX counters {};
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+	                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+	                             sizeof(counters))) {
+		info.private_bytes = counters.PrivateUsage;
+		info.working_set   = counters.WorkingSetSize;
+	}
+	HEAP_SUMMARY summary {};
+	summary.cb = sizeof(summary);
+	if (HeapSummary(GetProcessHeap(), 0, &summary)) {
+		info.heap_committed = summary.cbCommitted;
+		info.heap_allocated = summary.cbAllocated;
+	}
+#endif
+	return info;
+}
 
 } // namespace Common

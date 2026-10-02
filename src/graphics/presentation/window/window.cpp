@@ -23,6 +23,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "heapProfiler.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -1069,6 +1070,25 @@ void WindowContext::UpdateTitle() {
 			            Common::FrameStats::g_eager_retired.exchange(0),
 			            Common::FrameStats::g_dep_mismatches.exchange(0),
 			            Common::FrameStats::g_eager_skipped.exchange(0));
+			// Every 10 s: where host memory goes (guest memory lives in sections, outside
+			// private bytes), to tell emulator heap growth from driver or Vulkan allocations.
+			static uint32_t mem_reports = 0;
+			if (mem_reports++ % 10 == 0) {
+				const auto process = Common::GetProcessMemoryInfo();
+				const auto vulkan  = graphic_ctx.GetMemoryUsage();
+				constexpr double MiB = 1024.0 * 1024.0;
+				std::printf("[mem] private=%.0fMB working_set=%.0fMB heap_committed=%.0fMB"
+				            " heap_allocated=%.0fMB vma_local=%.0fMB vma_host=%.0fMB"
+				            " vk_local_usage=%.0fMB vk_host_usage=%.0fMB\n",
+				            process.private_bytes / MiB, process.working_set / MiB,
+				            process.heap_committed / MiB, process.heap_allocated / MiB,
+				            vulkan.local_blocks / MiB, vulkan.host_blocks / MiB,
+				            vulkan.local_usage / MiB, vulkan.host_usage / MiB);
+				static uint32_t heap_reports = 0;
+				if (heap_reports++ % 3 == 0) {
+					Kyty::HeapProfileWriteReport(); // KYTY_HEAP_PROFILE only, every 30 s
+				}
+			}
 			std::fflush(stdout);
 			if (frame_times != nullptr) {
 				std::fflush(frame_times); // a killed process must not lose the last seconds
