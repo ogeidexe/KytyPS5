@@ -102,6 +102,85 @@ struct Use {
 	bool operator==(const Use&) const = default;
 };
 
+// An instruction's users, in the order they were added. Most values have one or two, which live
+// inside the instruction: translation adds a use for every operand it writes, and a heap
+// allocation each time was a large part of the translation cost.
+class UseList {
+public:
+	UseList() noexcept: m_inline {} {}
+	UseList(const UseList& other): UseList() {
+		Reserve(other.m_size);
+		std::copy_n(other.data(), other.m_size, data());
+		m_size = other.m_size;
+	}
+	UseList(UseList&& other) noexcept: UseList() {
+		if (other.m_capacity != 0) {
+			m_heap           = other.m_heap;
+			m_capacity       = other.m_capacity;
+			other.m_inline   = {};
+			other.m_capacity = 0;
+		} else {
+			m_inline = other.m_inline;
+		}
+		m_size       = other.m_size;
+		other.m_size = 0;
+	}
+	UseList& operator=(const UseList&) = delete;
+	UseList& operator=(UseList&&)      = delete;
+	~UseList() {
+		if (m_capacity != 0) {
+			delete[] m_heap;
+		}
+	}
+
+	[[nodiscard]] size_t     size() const noexcept { return m_size; }
+	[[nodiscard]] bool       empty() const noexcept { return m_size == 0; }
+	[[nodiscard]] Use*       data() noexcept { return m_capacity != 0 ? m_heap : m_inline.data(); }
+	[[nodiscard]] const Use* data() const noexcept {
+		return m_capacity != 0 ? m_heap : m_inline.data();
+	}
+	[[nodiscard]] Use*       begin() noexcept { return data(); }
+	[[nodiscard]] Use*       end() noexcept { return data() + m_size; }
+	[[nodiscard]] const Use* begin() const noexcept { return data(); }
+	[[nodiscard]] const Use* end() const noexcept { return data() + m_size; }
+
+	void push_back(const Use& use) {
+		Reserve(m_size + size_t {1});
+		data()[m_size++] = use;
+	}
+	void erase(const Use* position) noexcept {
+		Use* const first = data() + (position - data());
+		std::copy(first + 1, end(), first);
+		m_size--;
+	}
+	void clear() noexcept { m_size = 0; }
+
+private:
+	static constexpr size_t InlineCapacity = 2;
+
+	void Reserve(size_t count) {
+		const size_t capacity = m_capacity != 0 ? m_capacity : InlineCapacity;
+		if (count <= capacity) {
+			return;
+		}
+		const size_t grown = std::max(count, capacity * 2);
+		auto*        heap  = new Use[grown];
+		std::copy_n(data(), m_size, heap);
+		if (m_capacity != 0) {
+			delete[] m_heap;
+		}
+		m_heap     = heap;
+		m_capacity = static_cast<uint32_t>(grown);
+	}
+
+	uint32_t m_size     = 0;
+	uint32_t m_capacity = 0; // 0: the inline storage is in use
+	union {
+		std::array<Use, InlineCapacity> m_inline;
+		Use*                            m_heap;
+	};
+};
+
 // An instruction's operands. Up to four live inside the instruction, so following an operand
 // does not first load a separately allocated array (shader-resource evaluation walks operand
 // chains for every draw); longer lists (phis) move to the heap.
@@ -186,7 +265,7 @@ public:
 	}
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
-	[[nodiscard]] const std::vector<Use>& Uses() const;
+	[[nodiscard]] const UseList&          Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
 		if (evaluation_index == UINT32_MAX) {
@@ -229,7 +308,7 @@ private:
 	Block*              parent = nullptr;
 	OperandList         args;
 	std::vector<Block*> phi_blocks;
-	std::vector<Use>    uses;
+	UseList             uses;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <map>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <variant>
 
@@ -95,31 +97,28 @@ struct DefTable {
 		goto_variables[value.index][block] = definition;
 	}
 
-	const Value& Get(Block* block, SccTag) { return scc[block]; }
-	void         Set(Block* block, SccTag, Value value) { scc[block] = value; }
-	const Value& Get(Block* block, ExecTag) { return exec[block]; }
-	void         Set(Block* block, ExecTag, Value value) { exec[block] = value; }
-	const Value& Get(Block* block, ExecLoTag) { return exec_lo[block]; }
-	void         Set(Block* block, ExecLoTag, Value value) { exec_lo[block] = value; }
-	const Value& Get(Block* block, ExecHiTag) { return exec_hi[block]; }
-	void         Set(Block* block, ExecHiTag, Value value) { exec_hi[block] = value; }
-	const Value& Get(Block* block, VccTag) { return vcc[block]; }
-	void         Set(Block* block, VccTag, Value value) { vcc[block] = value; }
-	const Value& Get(Block* block, VccLoTag) { return vcc_lo[block]; }
-	void         Set(Block* block, VccLoTag, Value value) { vcc_lo[block] = value; }
-	const Value& Get(Block* block, VccHiTag) { return vcc_hi[block]; }
-	void         Set(Block* block, VccHiTag, Value value) { vcc_hi[block] = value; }
-	const Value& Get(Block* block, M0Tag) { return m0[block]; }
-	void         Set(Block* block, M0Tag, Value value) { m0[block] = value; }
+	// The single-instance registers live in Block::ssa_flag_values, in this order.
+	template <typename Tag>
+	static constexpr size_t FlagSlot() {
+		using Flags = std::tuple<SccTag, ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag,
+		                         M0Tag>;
+		static_assert(std::tuple_size_v<Flags> == Block::NumSsaFlagValues);
+		return []<size_t... I>(std::index_sequence<I...>) {
+			static_assert((std::is_same_v<Tag, std::tuple_element_t<I, Flags>> || ...));
+			return ((std::is_same_v<Tag, std::tuple_element_t<I, Flags>> ? I : 0) + ...);
+		}(std::make_index_sequence<std::tuple_size_v<Flags>> {});
+	}
+	template <typename Tag>
+	requires(std::is_empty_v<Tag>)
+	const Value& Get(Block* block, Tag) {
+		return block->ssa_flag_values[FlagSlot<Tag>()];
+	}
+	template <typename Tag>
+	requires(std::is_empty_v<Tag>)
+	void Set(Block* block, Tag, Value value) {
+		block->ssa_flag_values[FlagSlot<Tag>()] = value;
+	}
 
-	ValueMap                               scc;
-	ValueMap                               exec;
-	ValueMap                               exec_lo;
-	ValueMap                               exec_hi;
-	ValueMap                               vcc;
-	ValueMap                               vcc_lo;
-	ValueMap                               vcc_hi;
-	ValueMap                               m0;
 	std::unordered_map<uint32_t, ValueMap> goto_variables;
 };
 
@@ -165,7 +164,6 @@ Value InitialValue(M0Tag) {
 
 enum class ReadStep { Start, SetValue, PushPhiArgument };
 
-template <typename T>
 struct ReadState {
 	Block*   block = nullptr;
 	Value    result;
@@ -183,8 +181,16 @@ public:
 
 	template <typename T>
 	Value Read(T variable, Block* root) {
-		std::vector<ReadState<T>> stack {{}, {.block = root}};
-		const auto                prepare_phi = [&]() {
+		// Most reads find a definition in the reading block itself.
+		if (const auto& def = definitions.Get(root, variable); !def.IsEmpty()) {
+			return def;
+		}
+		// The walk below never reads another variable, so one stack serves every read.
+		auto& stack = read_stack;
+		EXIT_IF(!stack.empty());
+		stack.push_back({});
+		stack.push_back({.block = root});
+		const auto prepare_phi = [&]() {
 			auto&      state        = stack.back();
 			const auto predecessors = state.block->ImmPredecessors();
 			if (state.pred == predecessors.size()) {
@@ -242,7 +248,9 @@ public:
 				}
 			}
 		} while (stack.size() > 1);
-		return stack.back().result;
+		const auto result = stack.back().result;
+		stack.clear();
+		return result;
 	}
 
 	void Seal(Block* block) {
@@ -290,6 +298,7 @@ private:
 
 	std::unordered_map<Block*, std::map<Variable, Inst*>> incomplete_phis;
 	DefTable                                              definitions;
+	std::vector<ReadState>                                read_stack;
 };
 
 void VisitInstruction(Pass& pass, Block* block, Inst& inst) {

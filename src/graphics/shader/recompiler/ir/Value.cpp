@@ -173,7 +173,7 @@ Block* Inst::Parent() const {
 	return parent;
 }
 
-const std::vector<Use>& Inst::Uses() const {
+const UseList& Inst::Uses() const {
 	return uses;
 }
 
