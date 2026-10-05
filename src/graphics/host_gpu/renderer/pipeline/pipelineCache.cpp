@@ -523,6 +523,19 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (const char* tmp_path = std::getenv("KYTY_TMP_SPIRV_HASHES"); tmp_path != nullptr) { // TEMP A/B hook
+			uint64_t h = 1469598103934665603ull;
+			for (const auto w: result.spirv) {
+				h = (h ^ w) * 1099511628211ull;
+			}
+			static std::mutex tmp_mutex;
+			std::lock_guard tmp_lock(tmp_mutex);
+			if (FILE* f = std::fopen(tmp_path, "a")) {
+				std::fprintf(f, "%s %016" PRIx64 " %zu %016" PRIx64 "\n", stage_name, options.shader_hash,
+				             result.spirv.size(), h);
+				std::fclose(f);
+			}
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
@@ -835,6 +848,16 @@ struct PipelineCache::ProgramCache {
 			trace->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		}
 
+		static const bool tmp_fast_verify = std::getenv("KYTY_TMP_SRT_FAST_VERIFY") != nullptr; // TEMP
+		ShaderRecompiler::IR::ResourceSnapshot       tmp_res;
+		ShaderRecompiler::IR::ResourceSpecialization tmp_spec;
+		bool                                         tmp_ok = false;
+		if (tmp_fast_verify) {
+			ShaderRecompiler::IR::SetSrtFastPaths(false);
+			tmp_ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, tmp_res,
+			                                                    tmp_spec);
+			ShaderRecompiler::IR::SetSrtFastPaths(true);
+		}
 		Common::FrameStats::g_srt_evaluations.fetch_add(1, std::memory_order_relaxed);
 		auto recording = runtime;
 		if (trace != nullptr) {
@@ -849,6 +872,22 @@ struct PipelineCache::ProgramCache {
 		    entry.resource_plan, recording, entry.resources, entry.specialization,
 		    trace != nullptr && entry.srt_rematerialize ? &trace->raw : nullptr);
 		g_srt_recording = nullptr;
+		if (tmp_fast_verify) { // TEMP
+			static uint64_t checks = 0, mismatches = 0;
+			checks++;
+			if (tmp_ok != ok || !SameSnapshot(tmp_res, entry.resources) ||
+			    !(tmp_spec == entry.specialization)) {
+				mismatches++;
+				if (mismatches <= 20) {
+					std::printf("[tmp-srt-verify] MISMATCH program=%016" PRIx64 " ok=%d/%d\n",
+					            program_hash, int(tmp_ok), int(ok));
+				}
+			}
+			if ((checks & 0x3fff) == 0) {
+				std::printf("[tmp-srt-verify] checks=%" PRIu64 " mismatches=%" PRIu64 "\n", checks,
+				            mismatches);
+			}
+		}
 		EXIT_IF(!ok);
 		RecordSrtOutputs(program_hash, entry);
 		entry.srt_current = UINT32_MAX;
@@ -974,6 +1013,13 @@ struct PipelineCache::ProgramCache {
 		auto translated = [&] {
 			Common::FrameStats::TimeScope translate_scope(Common::FrameStats::g_translate_us);
 			Common::FrameStats::g_translate_count.fetch_add(1, std::memory_order_relaxed);
+			static const int repeat = [] { // TEMP profiling hook
+				const char* v = std::getenv("KYTY_TMP_TRANSLATE_REPEAT");
+				return v != nullptr ? std::atoi(v) : 0;
+			}();
+			for (int i = 0; i < repeat; i++) {
+				(void)ShaderRecompiler::TranslateProgram(params.code, options);
+			}
 			return ShaderRecompiler::TranslateProgram(params.code, options);
 		}();
 		if (translated.skip_dispatch) {
