@@ -100,13 +100,13 @@ int main() {
 	Check(ArchiveTests::CreateArchive(root / "game.zar", payload), "create archive fixture");
 	content_root = root;
 	{
-		FileStreamer native({});
+		FileStreamer native(AvPlayerFileReplacement {});
 		Check(native.Init("/app0/movie.bin"), "open native stream");
 		CheckStream(native, payload);
 	}
 	content_root = Common::MakeArchivePath(root / "game.zar");
 	{
-		FileStreamer archive({});
+		FileStreamer archive(AvPlayerFileReplacement {});
 		Check(archive.Init("/app0/assets/subdir/data.bin"), "open archived stream");
 		CheckStream(archive, payload);
 	}
@@ -124,7 +124,7 @@ int main() {
 	}
 	Check(callbacks.opens == 1 && callbacks.closes == 1, "close callback exactly once");
 	{
-		FileStreamer missing({});
+		FileStreamer missing(AvPlayerFileReplacement {});
 		Check(!missing.Init("/unmounted/movie.bin"), "reject unmapped media");
 	}
 	std::error_code error;
