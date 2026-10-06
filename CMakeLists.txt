@@ -391,6 +391,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(shader_fuzz_tests "${KYTY_TESTS_DIR}/ShaderFuzzTests.cpp")
 
 # Keeps device-address buffers alive until queued MoltenVK work completes (the game lost the device
 # otherwise). Needs a real Vulkan driver through SDL_VULKAN_LIBRARY, so it stays opt-in.
@@ -742,6 +743,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_fuzz COMMAND $<TARGET_FILE:shader_fuzz_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
