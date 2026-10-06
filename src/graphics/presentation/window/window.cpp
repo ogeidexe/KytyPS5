@@ -1106,11 +1106,15 @@ void WindowContext::UpdateTitle() {
 
 	frame_num++;
 	fps_frames++;
+	// The title shows a once-per-second FPS figure; refresh it only then (and for the first
+	// frame) instead of hopping to the main thread on every presented frame.
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+	} else if (frame_num != 1) {
+		return;
 	}
 
 	// This runs on every presented frame. Setting the title repaints the title bar and has to go
