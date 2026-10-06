@@ -215,12 +215,14 @@ void TestAioBatches() {
   using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
   using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
   using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
+  using WaitBatch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *, uint32_t, uint32_t *);
   const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
   const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
   const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
   const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
   const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
   const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
+  const auto wait_batch = reinterpret_cast<WaitBatch>(find("lgK+oIWkJyA"));
   constexpr char Payload[] = "AIO payload";
   const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
   Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
@@ -245,6 +247,28 @@ void TestAioBatches() {
             states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
             wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
         "single and batch polls and waits share completion notification state");
+  for (const uint32_t mode : {1u, 2u}) {
+    states.fill(-1);
+    Check(wait_batch(ids.data(), ids.size(), states.data(), mode, nullptr) == OK &&
+              states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
+              states[2] == Kernel::KERNEL_ERROR_ESRCH,
+          "batch waits for all and for any write every state");
+  }
+  states.fill(42);
+  Check(wait_batch(nullptr, 1, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+            wait_batch(ids.data(), 1, nullptr, 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+            wait_batch(ids.data(), 0, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
+            wait_batch(ids.data(), 129, states.data(), 1, nullptr) ==
+                Kernel::KERNEL_ERROR_EINVAL &&
+            states == std::array<int32_t, 3> {42, 42, 42},
+        "invalid batch wait arguments do not modify outputs");
+  int32_t fresh_id = 0;
+  int32_t fresh_state = -1;
+  uint32_t timeout = 1000;
+  Check(submit(&request, 1, 2, &fresh_id) == OK &&
+            wait_batch(&fresh_id, 1, &fresh_state, 1, &timeout) == OK && fresh_state == 3 &&
+            erase_one(fresh_id, &fresh_state) == OK && fresh_state == OK,
+        "batch wait reports a fresh submission as completed");
   Check(erase(ids.data(), ids.size(), states.data()) == OK &&
             states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
         "batch deletion writes per-request results");

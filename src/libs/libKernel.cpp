@@ -3075,6 +3075,26 @@ int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* use
 	return KernelAioPollRequest(id, state);
 }
 
+int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* states, uint32_t mode,
+                                        uint32_t* usec) {
+	if (ids == nullptr || states == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	// Requests finish before their submission returns, so waiting for all of them (AND) and for
+	// any of them (OR) report the same states.
+	(void)mode;
+	for (int32_t i = 0; i < num; i++) {
+		const auto result = KernelAioWaitRequest(ids[i], &states[i], usec);
+		if (result != OK) {
+			return result;
+		}
+	}
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelAioDeleteRequest(int32_t id, int32_t* ret) {
 	PRINT_NAME();
 
@@ -3455,6 +3475,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("2pOuoWoCxdk", KernelAioPollRequest);
 	LIB_FUNC("o7O4z3jwKzo", KernelAioPollRequests);
 	LIB_FUNC("KOF-oJbQVvc", KernelAioWaitRequest);
+	LIB_FUNC("lgK+oIWkJyA", KernelAioWaitRequests);
 	LIB_FUNC("XQ8C8y+de+E", KernelAioSubmitWriteCommands);
 	LIB_FUNC("nu4a0-arQis", KernelAioInitializeParam);
 	LIB_FUNC("il03nluKfMk", LibKernel::KernelRaiseException);
