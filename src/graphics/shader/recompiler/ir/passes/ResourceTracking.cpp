@@ -1594,8 +1594,11 @@ private:
 			return false;
 		Value index;
 		uint32_t offset = 0, stride = 0;
+		// Both the shader-side immediate and the SMEM displacement are added unsigned at
+		// materialization, so neither may be a negative displacement.
 		if (!MatchTableOffset(read->Arg(1), index, offset, stride) || stride == 0u ||
-		    (stride & 3u) != 0u || uint64_t {offset} + memory->offset > UINT32_MAX) return false;
+		    (stride & 3u) != 0u || (offset & 0x80000000u) != 0u ||
+		    uint64_t {offset} + memory->offset > INT32_MAX) return false;
 		const auto* bound = BoundedLoop(index, image.Parent());
 		if (bound == nullptr) return false;
 		indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead{
