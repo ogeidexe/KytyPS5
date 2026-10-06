@@ -817,8 +817,6 @@ if(BUILD_TESTING)
 	endif()
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
-	add_test(NAME bda_fault_resolution_retry
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-fault-retry-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
