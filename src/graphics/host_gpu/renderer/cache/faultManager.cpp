@@ -30,7 +30,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
-
+	std::memset(m_download_buffer.Mapped().data(), 0, static_cast<size_t>(m_download_buffer.Size()));
+m_download_buffer.Flush(0, m_download_buffer.Size());
+	
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -82,9 +84,8 @@ void FaultManager::ProcessFaultBuffer() {
 
 	const auto offset = m_current_area * PageFaultAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
-
+	std::memset(mapped, 0, sizeof(uint64_t));
+	m_download_buffer.Flush(offset, sizeof(uint64_t));
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
@@ -146,10 +147,28 @@ if (raw_count > MaxPageFaults - 1u) {
 	           raw_count, count);
 }
 		for (uint32_t index = 1; index <= count; ++index) {
+
+	const auto address = BufferCache::GuestAddress(faults[index]);
+	fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+	if (index <= 16u) {
+		LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+	}
+}
+if (count > 16u) {
+	LOGF_COLOR(Log::Color::BrightYellow,
+	           "FaultManager: %u more faults suppressed\n", count - 16u);
+}
+}
+if (count > 16u) {
+    LOGF_COLOR(Log::Color::BrightYellow,
+               "FaultManager: %u more faults suppressed\n", count - 16u);
+}
+
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
+
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
