@@ -819,6 +819,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME bda_page_table_initialization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-page-table-init-only)
+	add_test(NAME bda_fault_resolution_retry
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-fault-retry-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
