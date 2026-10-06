@@ -1142,6 +1142,8 @@ private:
 		    [&](const Inst& inst) { return &inst == definition; });
 		if (where == block->Instructions().end()) return {};
 		++where;
+		// A key defined by a Phi must not split the block's Phi group.
+		while (where != block->Instructions().end() && where->GetOpcode() == ValueOpcode::Phi) ++where;
 		const Value value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32, {key, Value(low)}));
 		m_masked_keys.emplace_back(key, low, value);
 		return value;

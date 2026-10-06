@@ -371,9 +371,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			// Selector words behind a scalar pointer: no buffer bounds to honour.
 			uint32_t first = 0, count = 0;
 			if (!clean.Evaluate(indirect.selector_first, first) ||
-			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes)
+			    !clean.Evaluate(indirect.key_count, count))
 				return false;
+			// Signed bounds normalize to zero before the probe limit, as for immediate keys.
 			if (std::bit_cast<int32_t>(count) <= 0) count = 0;
+			if (count > MaxIndirectDescriptorProbes) return false;
 			const auto material_base =
 			    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
 			keys.resize(count);
