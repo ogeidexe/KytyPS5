@@ -47,6 +47,16 @@ namespace Libs::Graphics {
 
 namespace {
 
+uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+	switch (static_cast<Prospero::BlendFactor>(factor)) {
+		case Prospero::BlendFactor::kSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		default: return factor;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -102,8 +112,10 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
+	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
 bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
@@ -523,19 +535,6 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-		if (const char* tmp_path = std::getenv("KYTY_TMP_SPIRV_HASHES"); tmp_path != nullptr) { // TEMP A/B hook
-			uint64_t h = 1469598103934665603ull;
-			for (const auto w: result.spirv) {
-				h = (h ^ w) * 1099511628211ull;
-			}
-			static std::mutex tmp_mutex;
-			std::lock_guard tmp_lock(tmp_mutex);
-			if (FILE* f = std::fopen(tmp_path, "a")) {
-				std::fprintf(f, "%s %016" PRIx64 " %zu %016" PRIx64 "\n", stage_name, options.shader_hash,
-				             result.spirv.size(), h);
-				std::fclose(f);
-			}
-		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
@@ -757,7 +756,8 @@ struct PipelineCache::ProgramCache {
 	                        uint64_t program_hash) {
 		DumpSrtPlan(program_hash, entry);
 		constexpr uint32_t Slots   = 256;
-		const bool         enabled = SrtCacheEnabled() && !entry.srt_disabled;
+		// Workgroup counts are an evaluation input the traces do not record.
+		const bool         enabled = SrtCacheEnabled() && !entry.srt_disabled && runtime.workgroup_counts.empty();
 		SrtTrace*          trace   = nullptr;
 		uint32_t           slot    = 0;
 		if (enabled) {
@@ -848,16 +848,6 @@ struct PipelineCache::ProgramCache {
 			trace->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		}
 
-		static const bool tmp_fast_verify = std::getenv("KYTY_TMP_SRT_FAST_VERIFY") != nullptr; // TEMP
-		ShaderRecompiler::IR::ResourceSnapshot       tmp_res;
-		ShaderRecompiler::IR::ResourceSpecialization tmp_spec;
-		bool                                         tmp_ok = false;
-		if (tmp_fast_verify) {
-			ShaderRecompiler::IR::SetSrtFastPaths(false);
-			tmp_ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, tmp_res,
-			                                                    tmp_spec);
-			ShaderRecompiler::IR::SetSrtFastPaths(true);
-		}
 		Common::FrameStats::g_srt_evaluations.fetch_add(1, std::memory_order_relaxed);
 		auto recording = runtime;
 		if (trace != nullptr) {
@@ -872,22 +862,6 @@ struct PipelineCache::ProgramCache {
 		    entry.resource_plan, recording, entry.resources, entry.specialization,
 		    trace != nullptr && entry.srt_rematerialize ? &trace->raw : nullptr);
 		g_srt_recording = nullptr;
-		if (tmp_fast_verify) { // TEMP
-			static uint64_t checks = 0, mismatches = 0;
-			checks++;
-			if (tmp_ok != ok || !SameSnapshot(tmp_res, entry.resources) ||
-			    !(tmp_spec == entry.specialization)) {
-				mismatches++;
-				if (mismatches <= 20) {
-					std::printf("[tmp-srt-verify] MISMATCH program=%016" PRIx64 " ok=%d/%d\n",
-					            program_hash, int(tmp_ok), int(ok));
-				}
-			}
-			if ((checks & 0x3fff) == 0) {
-				std::printf("[tmp-srt-verify] checks=%" PRIu64 " mismatches=%" PRIu64 "\n", checks,
-				            mismatches);
-			}
-		}
 		EXIT_IF(!ok);
 		RecordSrtOutputs(program_hash, entry);
 		entry.srt_current = UINT32_MAX;
@@ -941,15 +915,15 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 			.validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
 		if (entry != programs.end()) {
 			Materialize(entry->second, runtime, params.hash);
 			if (const auto permutation = std::ranges::find_if(
@@ -1013,20 +987,8 @@ struct PipelineCache::ProgramCache {
 		auto translated = [&] {
 			Common::FrameStats::TimeScope translate_scope(Common::FrameStats::g_translate_us);
 			Common::FrameStats::g_translate_count.fetch_add(1, std::memory_order_relaxed);
-			static const int repeat = [] { // TEMP profiling hook
-				const char* v = std::getenv("KYTY_TMP_TRANSLATE_REPEAT");
-				return v != nullptr ? std::atoi(v) : 0;
-			}();
-			for (int i = 0; i < repeat; i++) {
-				(void)ShaderRecompiler::TranslateProgram(params.code, options);
-			}
 			return ShaderRecompiler::TranslateProgram(params.code, options);
 		}();
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch = true;
-			return {};
-		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -1310,14 +1272,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
-			// Preserve logical alpha when the export mapping moves it.
-			pixel_info.alpha_blend_source_remap = true;
-			pixel_info.dual_source_blending     = true;
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = {};
+		                       [](uint8_t mode) { return mode == 0; })) {
+			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
+				case BlendMappingSupport::SourceAlpha:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
+					break;
+				case BlendMappingSupport::SourceAlphaOne:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+					break;
+				case BlendMappingSupport::SourceAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+					break;
+				default: break;
+			}
+			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				pixel_info.dual_source_blending     = true;
+				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+				pixel_info.target_export_mapping[1] = {};
+			}
 		}
 	}
 	if (context.GetClipControl().clip_disable) {
@@ -1351,6 +1323,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
@@ -1405,19 +1379,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                           = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                           = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[slot]       = bc.color_srcblend;
-		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-		static_params.color_destblend[slot]      = bc.color_destblend;
-		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
-		const bool alpha_remap =
-		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
+		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		auto alpha_source = ShaderAlphaBlendSource::None;
+		if (slot == 0 && ps_input_info != nullptr) {
+			alpha_source = ps_input_info->alpha_blend_source;
+		}
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && !alpha_remap &&
+		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
@@ -1429,8 +1398,33 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
-		if (alpha_remap) {
-			static_params.blend_alpha_source_remap = true;
+		if (static_params.blend_enable[slot]) {
+			auto blend = bc;
+			switch (alpha_source) {
+				case ShaderAlphaBlendSource::SourceAlpha:
+					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::SourceAlphaOne:
+				case ShaderAlphaBlendSource::SourceAlphaZero:
+					// The second source carries the mapped source factor; its alpha stays logical Sa.
+					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+					blend.color_destblend =
+					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::None: break;
+			}
+			static_params.color_srcblend[slot]       = blend.color_srcblend;
+			static_params.color_comb_fcn[slot]       = blend.color_comb_fcn;
+			static_params.color_destblend[slot]      = blend.color_destblend;
+			static_params.separate_alpha_blend[slot] = blend.separate_alpha_blend;
+			if (blend.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = blend.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = blend.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = blend.alpha_destblend;
+			}
 		}
 	}
 	const bool with_depth =
@@ -1477,13 +1471,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	const bool rect_list             = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back          = !rect_list && mc.cull_back;
-	static_params.cull_front         = !rect_list && mc.cull_front;
-	static_params.face               = mc.face;
+	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	static_params.cull_back  = !rect_list && mc.cull_back;
+	static_params.cull_front = !rect_list && mc.cull_front;
+	static_params.face       = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);

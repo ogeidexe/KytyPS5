@@ -150,7 +150,7 @@ private:
 	// guest memory on every page neither side has modified since the last synchronization.
 	void VerifyCoherence(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                         std::vector<vk::BufferCopy>& copies,

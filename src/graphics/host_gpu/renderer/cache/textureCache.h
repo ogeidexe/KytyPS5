@@ -72,6 +72,7 @@ public:
 	// A scheduled image download stops owning its guest bytes once its image is freed, but the
 	// bytes only become current when the deferred write-back runs.
 	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

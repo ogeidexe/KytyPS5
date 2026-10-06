@@ -363,6 +363,12 @@ public:
 	void setDepthBiasEnable(vk::Bool32 enable) const {
 		Run([=](vk::CommandBuffer c) { c.setDepthBiasEnable(enable); });
 	}
+	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		Run([=](vk::CommandBuffer c) { c.setDepthBoundsTestEnable(enable); });
+	}
+	void setDepthBounds(float min_bounds, float max_bounds) const {
+		Run([=](vk::CommandBuffer c) { c.setDepthBounds(min_bounds, max_bounds); });
+	}
 	void setDepthTestEnable(vk::Bool32 enable) const {
 		Run([=](vk::CommandBuffer c) { c.setDepthTestEnable(enable); });
 	}

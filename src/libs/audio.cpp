@@ -1,6 +1,5 @@
 #include "libs/audio.h"
 
-#include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/frameStats.h"
 #include "common/emulatorConfig.h"
@@ -13,8 +12,10 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <cstdlib>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
@@ -38,6 +39,24 @@ constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US = 40000;
 
 constexpr int      AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
 constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
+
+struct OutputClock {
+	uint64_t next_time = 0;
+	uint64_t remainder = 0;
+
+	uint64_t Advance(uint64_t now, uint32_t frames, uint32_t rate) {
+		// Preserve small scheduling errors; discard timing debt after a discontinuity.
+		if (next_time == 0 || (now > next_time && now - next_time > 100000)) {
+			next_time = now;
+			remainder = 0;
+		}
+		const auto deadline = next_time;
+		const auto duration = 1000000ULL * frames + remainder;
+		next_time += duration / rate;
+		remainder = duration % rate;
+		return deadline;
+	}
+};
 
 static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
@@ -100,17 +119,17 @@ public:
 
 private:
 	struct PortOut {
-		bool     used             = false;
-		int      type             = 0;
-		uint32_t samples_num      = 0;
-		uint32_t freq             = 0;
-		Format   format           = Format::Unknown;
-		uint64_t last_output_time = 0;
-		bool     queue_primed     = false;
-		int      channels_num     = 0;
-		int      volume[12]       = {};
+		bool        used        = false;
+		int         type        = 0;
+		uint32_t    samples_num = 0;
+		uint32_t    freq        = 0;
+		Format      format      = Format::Unknown;
+		OutputClock clock;
+		bool        queue_primed = false;
+		int         channels_num = 0;
+		int         volume[12]   = {};
 
-		SDL_AudioStream*                     stream  = nullptr;
+		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
 	};
 
@@ -147,8 +166,8 @@ private:
 	static void            OpenSdlDevice(PortIn* port, Format format);
 	static void            CloseSdlDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
-	                                           std::vector<uint8_t>* buffer);
-	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
+	                                           std::vector<uint8_t>* buffer, float gain);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain);
 };
 
 static Audio* g_audio = nullptr;
@@ -290,7 +309,7 @@ void Audio::CloseSdlDevice(PortOut* port) {
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
-                                       std::vector<uint8_t>* buffer) {
+                                       std::vector<uint8_t>* buffer, float gain) {
 	EXIT_IF(data == nullptr);
 	EXIT_IF(buffer == nullptr);
 
@@ -300,7 +319,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
-	bool volume_changed = false;
+	bool volume_changed = gain != 1.0f;
 	for (uint32_t ch = 0; ch < channels; ch++) {
 		if (port.volume[ch] != 32768) {
 			volume_changed = true;
@@ -326,7 +345,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				dst[frame * output_channels + ch] =
 				    src[frame * channels + src_ch] *
-				    (static_cast<float>(port.volume[src_ch]) / 32768.0f);
+				    (static_cast<float>(port.volume[src_ch]) / 32768.0f) * gain;
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -335,7 +354,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
 					    src[frame * channels + 8 + ch] *
-					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f);
+					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f) * gain;
 				}
 			}
 		}
@@ -348,6 +367,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				int64_t sample =
 				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				sample = static_cast<int64_t>(sample * static_cast<double>(gain));
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -361,7 +381,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
@@ -369,7 +389,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
+	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer, gain);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
@@ -392,13 +412,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		// cap of 16 silently stopped at ~171 ms for 512-sample ports).
 		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 96u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		auto queued                = SDL_GetAudioStreamQueued(port->stream);
-		if (queued < static_cast<int>(prepared_size)) {
-			if (port->queue_primed) {
-				Common::FrameStats::g_audio_underruns.fetch_add(1, std::memory_order_relaxed);
-			}
-			port->queue_primed = false;
-		}
+		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearAudioStream(port->stream);
@@ -408,25 +422,22 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 			Common::Thread::SleepMicro(1000);
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
-		// No extra time-based sleep here. The queue-depth wait above already paces the writer at
-		// exactly the rate the device consumes. Sleeping until last_output_time + buffer_us on top
-		// of it made every cycle one buffer period plus the call and wake-up overhead, so output
-		// ran slower than real time, drained the queue and underran every few seconds.
+		if (queued < static_cast<int>(prepared_size)) {
+			if (port->queue_primed) {
+				Common::FrameStats::g_audio_underruns.fetch_add(1, std::memory_order_relaxed);
+			}
+			port->queue_primed = false;
+		}
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
+		port->queue_primed = false;
 		return false;
 	}
-	if (const auto bytes_per_second =
-	        static_cast<uint64_t>(BytesPerSample(port->format)) * output_channels * port->freq;
-	    bytes_per_second != 0) {
-		const auto queued_ms = static_cast<uint32_t>(
-		    static_cast<uint64_t>(SDL_GetAudioStreamQueued(port->stream)) * 1000 / bytes_per_second);
-		auto seen = Common::FrameStats::g_audio_queue_max_ms.load(std::memory_order_relaxed);
-		while (queued_ms > seen && !Common::FrameStats::g_audio_queue_max_ms.compare_exchange_weak(
-		                               seen, queued_ms, std::memory_order_relaxed)) {
-		}
+	// Unpaced priming must not advance the playback deadline into the future.
+	if (!port->queue_primed) {
+		port->clock = {};
 	}
 	if (blocking && !port->queue_primed &&
 	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
@@ -437,18 +448,21 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 }
 
 Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
+	if (freq == 0) {
+		return Id::Invalid();
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < OUT_PORTS_MAX; id++) {
 		if (!m_out_ports[id].used) {
 			auto& port = m_out_ports[id];
 
-			port.used             = true;
-			port.type             = type;
-			port.samples_num      = samples_num;
-			port.freq             = freq;
-			port.format           = format;
-			port.last_output_time = 0;
+			port.used        = true;
+			port.type        = type;
+			port.samples_num = samples_num;
+			port.freq        = freq;
+			port.format      = format;
 
 			switch (format) {
 				case Format::Signed16bitMono:
@@ -552,76 +566,79 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 }
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
-	EXIT_NOT_IMPLEMENTED(num == 0);
+	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
-	const auto first_id      = params[0].handle.GetId();
-	const auto first_samples = m_out_ports[first_id].samples_num;
-
-	uint64_t block_time = 0;
-	{
-		Common::LockGuard port_lock(m_out_port_mutex[first_id]);
-		block_time = (1000000 * m_out_ports[first_id].samples_num) / m_out_ports[first_id].freq;
-	}
-
-	uint64_t current_time = LibKernel::KernelGetProcessTime();
-
-	uint64_t max_wait_time      = 0;
-	bool     any_port_has_device = false;
-	for (uint32_t i = 0; i < num; i++) {
-		const auto port_id = params[i].handle.GetId();
-		if (port_id < 0 || port_id >= OUT_PORTS_MAX) {
-			continue;
-		}
-		Common::LockGuard port_lock(m_out_port_mutex[port_id]);
-		const auto&       port      = m_out_ports[port_id];
-		const uint64_t    next_time = port.last_output_time + block_time;
-		const uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
-		max_wait_time             = (wait_time > max_wait_time ? wait_time : max_wait_time);
-		if (port.stream != nullptr) {
-			any_port_has_device = true;
-		}
-	}
-
-	// One real output device is enough to pace the whole synchronized batch. Applying the fallback
-	// when a vibration port is present would rate-limit the device-backed ports to exactly 1x and
-	// prevent their SDL queues from building an underrun cushion.
-	if (blocking && max_wait_time != 0 && !any_port_has_device) {
-		Common::Thread::SleepMicro(max_wait_time);
-	}
+	const auto&                     first_port = m_out_ports[params[0].handle.GetId()];
+	std::array<bool, OUT_PORTS_MAX> paced {};
+	bool                            any_device = false;
+	uint64_t                        deadline   = 0;
 
 	for (uint32_t i = 0; i < num; i++) {
-		const auto port_id = params[i].handle.GetId();
-		if (port_id < 0 || port_id >= OUT_PORTS_MAX) {
-			continue;
-		}
-		Common::LockGuard port_lock(m_out_port_mutex[port_id]);
-		auto&             port = m_out_ports[port_id];
+		auto& port = m_out_ports[params[i].handle.GetId()];
+		const float gain =
+		    port.type == AUDIO_OUT_PORT_TYPE_PADSPK
+		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
+		    : port.type == AUDIO_OUT_PORT_TYPE_VIBRATION
+		        ? Controller::GetSettingScale(Controller::Setting::VibrationIntensity)
+		        : 1.0f;
 
 		uint64_t controller_queued_us = 0;
+		bool controller_uses_bluetooth = false;
 		if (port.haptics != nullptr) {
 			// The port lock already excludes AudioOutClose, which tears the haptics stream down
 			// under the same lock. Do not take m_mutex here: AudioOutClose takes m_mutex before
 			// the port lock, so taking it after the port lock would deadlock.
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
-			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
+			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
+			    gain);
+			controller_uses_bluetooth =
+			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			QueueSdlAudio(&port, params[i].data, blocking);
-		} else if (blocking && port.type == AUDIO_OUT_PORT_TYPE_PADSPK &&
-		           controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
-			// Vibration never paces output; the speaker is audible, so pace it like other ports.
-			Common::Thread::SleepMicro(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US);
+			if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
+				any_device = true;
+				paced[i]   = port.queue_primed;
+			}
+		} else {
+			port.queue_primed = false;
+			// Bluetooth HID has its own sender. Let the sample clock pace a batch
+			// without another audio device, instead of waiting on the HID queue.
+			if (port.type == AUDIO_OUT_PORT_TYPE_PADSPK && !controller_uses_bluetooth) {
+				any_device = true;
+				if (blocking && controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
+					// Limit a stalled USB endpoint to one audio block of waiting.
+					const uint64_t block_us = 1000000ULL * port.samples_num / port.freq;
+					deadline = std::max(deadline, LibKernel::KernelGetProcessTime() +
+					                                  std::min(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US,
+					                                           block_us));
+				}
+			}
 		}
-		// Update the clock under the same lock, otherwise a concurrent batch for this port
-		// can read a stale value and the two writes end up paced off the same deadline.
-		port.last_output_time = LibKernel::KernelGetProcessTime();
 	}
 
-	return first_samples;
+	// Submit the whole batch before pacing it. Audible devices own its cadence while
+	// priming; silent/vibration-only batches use the same sample clock as SDL output.
+	const auto now = LibKernel::KernelGetProcessTime();
+	for (uint32_t i = 0; i < num; i++) {
+		auto& port = m_out_ports[params[i].handle.GetId()];
+		if (blocking && (paced[i] || !any_device)) {
+			deadline = std::max(deadline, port.clock.Advance(now, port.samples_num, port.freq));
+		} else {
+			port.clock = {};
+		}
+		if (!blocking) {
+			port.queue_primed = false;
+		}
+	}
+	if (deadline > now) {
+		Common::Thread::SleepMicro(deadline - now);
+	}
+
+	return first_port.samples_num;
 }
 
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
@@ -866,6 +883,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	if (!audio_out_port_type_is_valid(type)) {
 		return AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
 	}
+	if (freq == 0) {
+		return AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
+	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
 
 	Audio::Format format       = Audio::Format::Unknown;
@@ -975,6 +995,9 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(param == nullptr);
+	if (num == 0 || num > Audio::OUT_PORTS_MAX) {
+		return AUDIO_OUT_ERROR_INVALID_SIZE;
+	}
 
 	Audio::OutputParam params[Audio::OUT_PORTS_MAX];
 

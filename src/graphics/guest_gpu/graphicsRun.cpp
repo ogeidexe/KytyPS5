@@ -42,7 +42,6 @@ namespace Libs::Graphics {
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
-static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
@@ -93,27 +92,6 @@ static uint32_t SpeculativeIndirectInterval() {
 	return interval;
 }
 
-class GpuMutexLock final {
-public:
-	explicit GpuMutexLock(Common::Mutex& mutex): m_mutex(mutex) {
-		if (g_gpu_mutex_owned) {
-			EXIT("recursive GPU mutex acquisition\n");
-		}
-		g_gpu_mutex_owned = true;
-		m_mutex.Lock();
-	}
-	~GpuMutexLock() {
-		if (!g_gpu_mutex_owned) {
-			EXIT("invalid GPU mutex release\n");
-		}
-		m_mutex.Unlock();
-		g_gpu_mutex_owned = false;
-	}
-
-private:
-	Common::Mutex& m_mutex;
-};
-
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -123,6 +101,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -199,20 +178,16 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
-	GpuMutexLock lock(m_submission_mutex);
-	Submission   submission;
+	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
-	submission.reset_processor   = m_graphics_done;
-	m_graphics_done              = false;
 	Enqueue(std::move(submission));
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
 	EXIT_IF(commands.empty());
-	GpuMutexLock lock(m_submission_mutex);
 
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
@@ -225,22 +200,21 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
-	GpuMutexLock lock(m_submission_mutex);
-	Submission   submission;
+	Submission submission;
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;
-	submission.reset_processor = m_graphics_done;
 	submission.flip_request_id = request_id;
-	m_graphics_done            = false;
 	Enqueue(std::move(submission));
 }
 
-void GuestGpu::Done() {
-	GpuMutexLock lock(m_submission_mutex);
-	if (!IsGpuThread()) {
-		WaitForIdle();
-	}
-	m_graphics_done = true;
+void GuestGpu::SuspendPoint() {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	// Do not hold a queue lock while waiting: asynchronous work may be needed to
+	// finish the preceding graphics frame. The first point returns immediately.
+	m_suspend_point_ready->acquire();
+	Submission submission;
+	submission.type = SubmissionType::SuspendPoint;
+	Enqueue(std::move(submission));
 	m_done_num++;
 }
 
@@ -268,6 +242,9 @@ void CommandProcessor::Reset() {
 	m_context_state_pushed             = false;
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
+	m_index_base_addr                  = 0;
+	m_num_instances                    = 1;
+	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
@@ -574,6 +551,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
@@ -679,11 +657,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
-	auto& cp = GetProcessor(submission.queue_id);
-
-	if (first_slice && submission.reset_processor) {
-		cp.Reset();
-	}
+	auto&      cp          = GetProcessor(submission.queue_id);
 
 	if (first_slice) {
 		Common::FrameStats::StoreMax(
@@ -763,6 +737,13 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
+			break;
+		case SubmissionType::SuspendPoint:
+			cp.EmitGlobalBarrier();
+			m_renderer.GetCommandScheduler().DeferPriorityOperation(
+			    [ready = m_suspend_point_ready] { ready->release(); });
+			cp.BufferFlush();
+			cp.Reset();
 			break;
 	}
 
@@ -1110,70 +1091,15 @@ void CommandProcessor::ReadIndirectArgs(void* dst, uint64_t address, uint32_t si
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
-	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
-
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
-
-	if (!indexed) {
-		DrawIndirectArgs args {};
-		ReadIndirectArgs(&args, reinterpret_cast<uint64_t>(args_addr), sizeof(args));
-		if (args.vertex_count_per_instance == 0 || args.instance_count == 0) {
-			Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
-		}
-		m_num_instances = args.instance_count;
-		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
-		               .instance_count = args.instance_count,
-		               .first_vertex   = args.start_vertex_location,
-		               .first_instance = args.start_instance_location,
-		               .offset_source  = DrawOffsetSource::IndirectArgs});
-		return;
-	}
-
-	DrawIndexedIndirectArgs args {};
-	ReadIndirectArgs(&args, reinterpret_cast<uint64_t>(args_addr), sizeof(args));
-	if (args.index_count_per_instance == 0 || args.instance_count == 0) {
-		Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
-	}
-
-	uint64_t index_size = 0;
-	switch (m_index_type_and_size) {
-		case 0: index_size = 2; break;
-		case 1: index_size = 4; break;
-		case 2: index_size = 1; break;
-		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-	}
-
-	auto* index_addr = reinterpret_cast<const void*>(
-	    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
-
-	const uint32_t index_count =
-	    (m_index_buffer_size != 0 ? std::min(args.index_count_per_instance, m_index_buffer_size)
-	                              : args.index_count_per_instance);
-	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-			LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
-			     " using INDEX_BUFFER_SIZE\n",
-			     args.index_count_per_instance, index_count);
-		}
-	}
-
-	m_num_instances = args.instance_count;
-	DrawIndex({.index_count    = index_count,
-	           .index_addr     = index_addr,
-	           .instance_count = args.instance_count,
-	           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
-	           .first_instance = args.start_instance_location,
-	           .offset_source  = DrawOffsetSource::IndirectArgs});
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	DrawIndirectMulti(data_offset, 1, nullptr, args_size, draw_initiator, indexed);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	uint32_t draw_count = max_count_or_count;
@@ -1207,7 +1133,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		Common::GpuWaitDiagnostics::Note("indirect-multi", args_addr, i, draw_count, indexed);
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			DrawIndirectArgs args_copy {};
+			ReadIndirectArgs(&args_copy, args_addr, sizeof(args_copy));
+			const auto* args = &args_copy;
+			if (args->vertex_count_per_instance == 0 || args->instance_count == 0) {
+				Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
+			}
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1217,7 +1148,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			continue;
 		}
 
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		DrawIndexedIndirectArgs args_copy {};
+		ReadIndirectArgs(&args_copy, args_addr, sizeof(args_copy));
+		const auto* args = &args_copy;
+		if (args->index_count_per_instance == 0 || args->instance_count == 0) {
+			Common::FrameStats::g_indirect_zero.fetch_add(1, std::memory_order_relaxed);
+		}
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
@@ -1250,9 +1186,6 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
-	// uint32_t local_x   = 1;
-	// uint32_t local_y   = 1;
-	// uint32_t local_z   = 1;
 
 	{
 		frame_num = m_renderer.GetGpu().GetFrameNum();
@@ -1274,35 +1207,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		const auto& cs = m_sh_ctx.GetCs().cs_regs;
-		// local_x        = std::max(cs.num_thread_x, 1u);
-		// local_y        = std::max(cs.num_thread_y, 1u);
-		// local_z        = std::max(cs.num_thread_z, 1u);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
-
-	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
-	auto               group_count = [](uint32_t threads, uint32_t group_size) {
-	    return (threads == 0
-	                ? 0u
-	                : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-	};
-
-	auto groups_x = thread_group_x;
-	auto groups_y = thread_group_y;
-	auto groups_z = thread_group_z;
-	if ((mode & DispatchInitiatorUseThreadDimensions) != 0) {
-	    groups_x = group_count(thread_group_x, local_x);
-	    groups_y = group_count(thread_group_y, local_y);
-	    groups_z = group_count(thread_group_z, local_z);
-	}
-
-	const uint64_t invocations =
-	    static_cast<uint64_t>(groups_x) * groups_y * groups_z * local_x * local_y * local_z;
-	if (invocations != 0) {
-	    BufferFlushAndWait();
-	}*/
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
