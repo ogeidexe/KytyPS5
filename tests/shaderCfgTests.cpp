@@ -236,6 +236,14 @@ std::string DisassembleSpirvBinary(const std::vector<uint32_t> &binary) {
   return std::string(source.c_str());
 }
 
+void SetEnvForTest(const char *name, const char *value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
 uint32_t CountSourceOccurrences(const std::string &source, const char *needle) {
   uint32_t count = 0;
   size_t from = 0;
@@ -14887,6 +14895,79 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
         "dispatcher size fixture lost its two control Phis or switch");
   CheckSpirvPhiParents(dispatcher_result.spirv);
+
+  // The baselines above run with the loop watchdog off. With it on, the guarded
+  // structured loop and the dispatcher loop must still validate and carry a counter.
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "65536");
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto guarded_structured = RecompileForTest(structured_phi, options);
+    CheckSpirvBinaryValidates(guarded_structured.spirv);
+    Check(MeasureSpirv(guarded_structured.spirv).function_variables >= 1u,
+          "loop watchdog added no counter to a structured loop");
+    // The break tests the cap, and so does the unconditional latch.
+    const auto guarded_source = DisassembleSpirvBinary(guarded_structured.spirv);
+    Check(CountSourceOccurrences(guarded_source, "OpUGreaterThanEqual") == 2u &&
+              CountSourceOccurrences(guarded_source, "OpSelect") == 1u,
+          "loop watchdog did not guard the structured loop break and latch");
+    const uint32_t endless[] = {
+        EncodeSop2(0x00, 0, 0, 129), // loop: s_add_u32 s0, s0, 1
+        EncodeSopp(0x02, 0xfffeu),   // s_branch loop
+        EncodeSopp(0x01),
+    };
+    const auto guarded_endless = RecompileForTest(endless, options);
+    CheckSpirvBinaryValidates(guarded_endless.spirv);
+    Check(CountSourceOccurrences(DisassembleSpirvBinary(guarded_endless.spirv),
+                                 "OpUGreaterThanEqual") == 1u,
+          "loop watchdog left a loop without any exit unbounded");
+    // A conditional latch that branches straight back to the header: the cap is folded
+    // into the latch condition, so there is one compare and one select.
+    const uint32_t direct_latch[] = {
+        EncodeSopp(0x02, 0),       // loop header -> conditional latch
+        EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+        EncodeSopp(0x05, 0xfffdu), // direct latch backedge -> loop header
+        0xbf810000u,
+    };
+    const auto guarded_latch = RecompileForTest(direct_latch, options);
+    CheckSpirvBinaryValidates(guarded_latch.spirv);
+    const auto guarded_latch_source = DisassembleSpirvBinary(guarded_latch.spirv);
+    Check(CountSourceOccurrences(guarded_latch_source, "OpUGreaterThanEqual") == 1u &&
+              CountSourceOccurrences(guarded_latch_source, "OpSelect") == 1u,
+          "loop watchdog did not guard the direct conditional latch");
+    // The unconditional latch's forced exit is a new edge into the merge block. When that
+    // block starts with a Phi, the Phi has no value for the edge, so the latch keeps no exit.
+    const uint32_t phi_exit[] = {
+        EncodeSMovB32(2, 128),       // s2 = 0
+        EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
+        EncodeSopp(0x04, 5),         // loop exit -> exit block
+        EncodeSMovB32(2, 129),       // s2 = 1
+        EncodeSopc(0x06, 1, 1),      // s_cmp_eq_u32 s1, s1
+        EncodeSopp(0x05, 2),         // break -> exit block
+        EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+        EncodeSopp(0x02, 0xfff9u),   // unconditional latch -> loop header
+        EncodeSopc(0x06, 2, 129),    // exit block: s_cmp_eq_u32 s2, 1 (reads the Phi of s2)
+        EncodeSopp(0x05, 1),         // skip the next instruction when equal
+        EncodeSMovB32(4, 129),
+        0xbf810000u,
+    };
+    const auto guarded_phi_exit = RecompileForTest(phi_exit, options);
+    CheckSpirvBinaryValidates(guarded_phi_exit.spirv);
+    CheckSpirvPhiParents(guarded_phi_exit.spirv);
+    const auto guarded_dispatcher = RecompileForTest(dispatcher, options);
+    CheckSpirvBinaryValidates(guarded_dispatcher.spirv);
+    Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,
+          "loop watchdog did not count the dispatcher loop");
+  }
+  // A value that is not a plain number must keep the watchdog on, not disable it.
+  for (const char* bad: {"abc", "12x", "-1", "+0", " 0", "99999999999"}) {
+    SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", bad);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto result = RecompileForTest(structured_phi, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(MeasureSpirv(result.spirv).function_variables >= 1u,
+          "non-numeric KYTY_SHADER_LOOP_LIMIT disabled the loop watchdog");
+  }
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "0");
 }
 
 void TestZeroBranchBallotIgnoresInactiveLanes() {
@@ -14932,6 +15013,9 @@ void TestZeroBranchBallotIgnoresInactiveLanes() {
 int main() {
   using namespace Libs::Graphics;
 
+  // Size baselines count every instruction. They are measured with the loop
+  // watchdog off; TestNewShaderRecompilerSpirvSizeBaselines checks it separately.
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "0");
   EnsureConfigInitialized();
   TestZeroBranchBallotIgnoresInactiveLanes();
   TestRayTracingInstructions();
