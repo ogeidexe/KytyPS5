@@ -1181,7 +1181,6 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	struct TitleUpdate {
 		SDL_WindowID window_id;
 		std::string  text;
