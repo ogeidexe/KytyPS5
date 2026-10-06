@@ -444,6 +444,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	// A dispatch that writes one uniform value over a whole buffer still runs, but its result is
+	// known, so later CPU-side consumers (DCC clear discovery) need not read it back from the GPU.
+	ShaderBufferResource fill_descriptor;
+	uint32_t             fill_value = 0;
+	uint64_t             fill_size  = 0;
+	const bool           uniform_fill =
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             fill_descriptor, fill_value, fill_size);
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -575,6 +583,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// FlushAndWait, which submits the current command buffer and begins a new one, so a
 	// barrier recorded afterwards would land on the already-submitted buffer.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (uniform_fill) {
+		// After binding, which registered this dispatch's writes and forgot older fills.
+		m_context.GetBufferCache().RecordKnownFill(fill_descriptor.Base48(), fill_size, fill_value);
+	}
 	if (dump_dispatch_buffers) {
 		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "after");
 	}

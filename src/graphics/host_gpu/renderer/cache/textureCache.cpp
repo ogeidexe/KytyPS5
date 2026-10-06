@@ -1317,9 +1317,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			bytes.assign(slice_size, uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			if (known_fill && address % sizeof(uint32_t) == 0 && slice_size % sizeof(uint32_t) == 0) {
+				// The metadata is GPU-resident (a known uniform fill): expand the keys there as
+				// well. Invalidating would read the region back only to overwrite all of it.
+				auto [dst, dst_offset] = m_buffer_cache.ObtainBuffer(address, slice_size, true, true);
+				dst->Fill(dst_offset, slice_size, 0xffffffffu);
+				m_buffer_cache.RecordKnownFill(address, slice_size, 0xffffffffu);
+			} else {
+				bytes.assign(slice_size, uint8_t {0xff});
+				m_buffer_cache.InvalidateMemory(address, slice_size);
+				LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			}
 		}
 	}
 }
