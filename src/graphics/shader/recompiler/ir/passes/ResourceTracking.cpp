@@ -1583,9 +1583,10 @@ private:
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32) return false;
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*read, memory_index);
+		// The selector offset is added unsigned at materialization: no negative displacement.
 		if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
-		    memory->data_dwords != 1u || (memory->offset & 3u) != 0u ||
-		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
+		    memory->data_dwords != 1u || (memory->offset & 0x80000000u) != 0u ||
+		    (memory->offset & 3u) != 0u || !MemoryIndexBelongsTo(memory_index, *read)) return false;
 		const auto* material_handle = read->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr ||
 		    material_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
