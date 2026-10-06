@@ -367,6 +367,22 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), 0u);
+		} else if (!indirect.selector_first.IsEmpty() && material_value.dword_count == 2u) {
+			// Selector words behind a scalar pointer: no buffer bounds to honour.
+			uint32_t first = 0, count = 0;
+			if (!clean.Evaluate(indirect.selector_first, first) ||
+			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes)
+				return false;
+			if (std::bit_cast<int32_t>(count) <= 0) count = 0;
+			const auto material_base =
+			    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
+			keys.resize(count);
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint64_t offset = (uint64_t {first} + i) * selector->stride + selector->offset;
+				if (offset > UINT32_MAX ||
+				    !ReadScalarTable(material_base, UINT64_MAX, offset, runtime, {&keys[i], 1}))
+					return false;
+			}
 		} else if (!indirect.selector_first.IsEmpty()) {
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
@@ -422,7 +438,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		const auto key = sources.empty() ? keys[entry] : entry;
 		DescriptorValue candidate;
 		candidate.dword_count = dword_count;
-		if (sources.empty()) {
+		if (sources.empty() && selector != nullptr && key >= 0x80000000u) {
+			// A negative selector value means "no resource": bind a null descriptor.
+		} else if (sources.empty()) {
 			const uint64_t table_offset =
 			    uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
 			    (indirect.table_immediate & ~3u);
