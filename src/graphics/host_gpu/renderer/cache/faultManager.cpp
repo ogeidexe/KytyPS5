@@ -84,8 +84,8 @@ void FaultManager::ProcessFaultBuffer() {
 
 	const auto offset = m_current_area * PageFaultAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, sizeof(uint64_t));
-	m_download_buffer.Flush(offset, sizeof(uint64_t));
+	std::memset(mapped, 0, PageFaultAreaSize);
+	m_download_buffer.Flush(offset, PageFaultAreaSize);
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
@@ -133,40 +133,26 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		// The fault-buffer compute shader stops writing at MAX_PAGE_FAULTS but
-// keeps incrementing the counter, so faults[0] may exceed the number of
-// valid entries. Clamp to the capacity of one fault area to avoid reading
-// past the end of this area into the next area's bytes.
-const auto raw_count = static_cast<uint32_t>(faults[0]);
-const auto count     = (raw_count < MaxPageFaults - 1u)
-                           ? raw_count
-                           : static_cast<uint32_t>(MaxPageFaults - 1u);
-if (raw_count > MaxPageFaults - 1u) {
-	LOGF_COLOR(Log::Color::BrightYellow,
-	           "FaultManager: counter overflow clamped (%u -> %u)\n",
-	           raw_count, count);
-}
+		// The fault-buffer compute shader stops writing at MAX_PAGE_FAULTS but keeps incrementing
+		// the counter, so faults[0] may exceed the number of valid entries. Clamp to the capacity
+		// of one fault area so the read stays inside this area.
+		const auto raw_count = static_cast<uint32_t>(faults[0]);
+		const auto count     = raw_count < MaxPageFaults - 1u ? raw_count
+		                                                      : static_cast<uint32_t>(MaxPageFaults - 1u);
+		if (raw_count > MaxPageFaults - 1u) {
+			LOGF_COLOR(Log::Color::BrightYellow, "FaultManager: counter overflow clamped (%u -> %u)\n",
+			           raw_count, count);
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
-
-	const auto address = BufferCache::GuestAddress(faults[index]);
-	fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-	if (index <= 16u) {
-		LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
-	}
-}
-if (count > 16u) {
-	LOGF_COLOR(Log::Color::BrightYellow,
-	           "FaultManager: %u more faults suppressed\n", count - 16u);
-}
-}
-if (count > 16u) {
-    LOGF_COLOR(Log::Color::BrightYellow,
-               "FaultManager: %u more faults suppressed\n", count - 16u);
-}
-
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			if (index <= 16u) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			}
+		}
+		if (count > 16u) {
+			LOGF_COLOR(Log::Color::BrightYellow, "FaultManager: %u more faults suppressed\n",
+			           count - 16u);
 		}
 
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
