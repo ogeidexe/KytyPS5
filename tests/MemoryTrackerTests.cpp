@@ -40,6 +40,14 @@
 #include <unistd.h>
 #endif
 
+// The page manager refuses to protect live guest stacks (kernel/pthread.cpp). This test runs no
+// guest threads, so no stack is ever live.
+namespace Libs::LibKernel {
+bool FindLiveGuestStack(uint64_t, uint64_t, uint64_t*, uint64_t*) {
+	return false;
+}
+} // namespace Libs::LibKernel
+
 namespace {
 
 using Libs::Graphics::GuestRange;

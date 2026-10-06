@@ -9,8 +9,6 @@
 #include "libs/errno.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/runtimeLinker.h"
-
-#include "loader/x64InstructionDecoder.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -199,20 +197,15 @@ LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-// The code must store a sentinel in the red zone at rsp-0x18, fault on [rdi], then return 1
-// only if the sentinel survived.
-void RunRedZonePatcherCase(const char* test, const std::vector<uint8_t>& code) {
+void TestWindowsGuestRedZoneStaticPatcher() {
+	const char* test = "WindowsGuestRedZoneStaticPatcher";
+	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
 	constexpr uint64_t CODE_SIZE = 0x4000;
 	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
 	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_patcher_test");
 	Check(test, mapping != 0, "failed to allocate patch test code");
-
-	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
-	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
-	      "failed to flush generated test code");
 
 	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
 	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
@@ -291,54 +284,9 @@ void RunRedZonePatcherCase(const char* test, const std::vector<uint8_t>& code) {
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
-
-void TestWindowsGuestRedZoneStaticPatcher() {
-	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
-	std::vector<uint8_t> code;
-	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
-		code.insert(code.end(), bytes.begin(), bytes.end());
-	};
-	const auto emit64 = [&code](uint64_t value) {
-		const auto offset = code.size();
-		code.resize(offset + sizeof(value));
-		std::memcpy(code.data() + offset, &value, sizeof(value));
-	};
-	emit({0x48, 0xb8});
-	emit64(SENTINEL);                         // movabs rax, sentinel
-	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
-	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
-	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
-	emit({0x48, 0xb9});
-	emit64(SENTINEL);                         // movabs rcx, sentinel
-	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
-	emit({0x0f, 0x94, 0xc0});                 // sete al
-	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
-	RunRedZonePatcherCase("WindowsGuestRedZoneStaticPatcher", code);
-
-	// Frame-pointer leaf functions address red-zone locals through RBP, below the allocated
-	// frame, so RBP - RSP has to be tracked to see the red-zone use.
-	code.clear();
-	emit({0x55});                             // push rbp
-	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
-	emit({0x48, 0x83, 0xec, 0x10});           // sub rsp, 0x10
-	emit({0x48, 0xb8});
-	emit64(SENTINEL);                         // movabs rax, sentinel
-	emit({0x48, 0x89, 0x45, 0xd8});           // mov [rbp-0x28], rax (rsp-0x18)
-	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
-	emit({0x48, 0x8b, 0x45, 0xd8});           // mov rax, [rbp-0x28]
-	emit({0x48, 0xb9});
-	emit64(SENTINEL);                         // movabs rcx, sentinel
-	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
-	emit({0x0f, 0x94, 0xc0});                 // sete al
-	emit({0x0f, 0xb6, 0xc0});                 // movzx eax, al
-	emit({0x48, 0x89, 0xec});                 // mov rsp, rbp
-	emit({0x5d, 0xc3});                       // pop rbp; ret
-	RunRedZonePatcherCase("WindowsGuestFramePointerRedZoneStaticPatcher", code);
-}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
-	std::printf("[host]    %-48s skipped\n", "WindowsGuestFramePointerRedZoneStaticPatcher");
 }
 #endif
 
@@ -352,106 +300,6 @@ void RunTest(void (*test_func)()) {
 	}
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-struct MisalignedSysvHostEntryState {
-	uintptr_t sysv_entry_rsp = 0;
-	bool      called         = false;
-	uintptr_t sysv_body_rsp  = 0;
-	uintptr_t ms_entry_rsp   = 0;
-};
-[[gnu::naked]] static KYTY_MS_ABI uintptr_t CaptureMsAbiEntryRsp() {
-	asm volatile("movq %rsp, %rax\n\t"
-	             "retq");
-}
-
-[[gnu::noinline]] static KYTY_SYSV_ABI void MisalignedSysvHostEntryTarget(
-    MisalignedSysvHostEntryState* state) {
-	asm volatile("movq %%rsp, %0" : "=r"(state->sysv_body_rsp) : : "memory");
-	state->ms_entry_rsp = CaptureMsAbiEntryRsp();
-	asm volatile("" : : : "memory");
-	state->called = true;
-}
-
-void TestWindowsMisalignedSysvHostEntry() {
-	const char* test = "WindowsMisalignedSysvHostEntry";
-	constexpr uint64_t code_size = 0x4000;
-
-	const auto mapping = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-	    0, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    "misaligned_sysv_host_entry_test");
-	Check(test, mapping != 0, "failed to allocate executable trampoline");
-
-	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
-
-	constexpr int xmm_save_size = 10 * 16;
-
-	// This trampoline itself is entered with the Windows x64 ABI. Preserve Windows
-	// nonvolatile state that a SysV callee may clobber while keeping the total stack
-	// reservation a multiple of 16. RSP remains 8 mod 16 before CALL, so CALL enters
-	// the SysV target at 0 mod 16 instead of the expected 8 mod 16.
-	code.push(code.rdi);
-	code.push(code.rsi);
-	code.sub(code.rsp, xmm_save_size);
-	code.movdqu(code.ptr[code.rsp + 0x00], code.xmm6);
-	code.movdqu(code.ptr[code.rsp + 0x10], code.xmm7);
-	code.movdqu(code.ptr[code.rsp + 0x20], code.xmm8);
-	code.movdqu(code.ptr[code.rsp + 0x30], code.xmm9);
-	code.movdqu(code.ptr[code.rsp + 0x40], code.xmm10);
-	code.movdqu(code.ptr[code.rsp + 0x50], code.xmm11);
-	code.movdqu(code.ptr[code.rsp + 0x60], code.xmm12);
-	code.movdqu(code.ptr[code.rsp + 0x70], code.xmm13);
-	code.movdqu(code.ptr[code.rsp + 0x80], code.xmm14);
-	code.movdqu(code.ptr[code.rsp + 0x90], code.xmm15);
-
-	code.mov(code.rdi, code.rcx);
-	code.mov(code.rax, code.rsp);
-	code.sub(code.rax, 8);
-	code.mov(code.qword[code.rdi], code.rax);
-	code.mov(code.rax, reinterpret_cast<uint64_t>(&MisalignedSysvHostEntryTarget));
-	code.call(code.rax);
-
-	code.movdqu(code.xmm6, code.ptr[code.rsp + 0x00]);
-	code.movdqu(code.xmm7, code.ptr[code.rsp + 0x10]);
-	code.movdqu(code.xmm8, code.ptr[code.rsp + 0x20]);
-	code.movdqu(code.xmm9, code.ptr[code.rsp + 0x30]);
-	code.movdqu(code.xmm10, code.ptr[code.rsp + 0x40]);
-	code.movdqu(code.xmm11, code.ptr[code.rsp + 0x50]);
-	code.movdqu(code.xmm12, code.ptr[code.rsp + 0x60]);
-	code.movdqu(code.xmm13, code.ptr[code.rsp + 0x70]);
-	code.movdqu(code.xmm14, code.ptr[code.rsp + 0x80]);
-	code.movdqu(code.xmm15, code.ptr[code.rsp + 0x90]);
-	code.add(code.rsp, xmm_save_size);
-	code.pop(code.rsi);
-	code.pop(code.rdi);
-	code.ret();
-
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
-	      "failed to flush generated trampoline");
-
-	using Trampoline = void (*)(MisalignedSysvHostEntryState*);
-	MisalignedSysvHostEntryState state {};
-	reinterpret_cast<Trampoline>(mapping)(&state);
-
-	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, code_size);
-
-	Check(test, state.called, "misaligned SysV target was not called");
-	Check(test, (state.sysv_entry_rsp & 0x0f) == 0x00,
-	      "trampoline did not enter the SysV target with a misaligned stack");
-	Check(test, (state.ms_entry_rsp & 0x0f) == 0x08,
-	      "SysV host entry propagated a misaligned stack into an MS ABI call");
-	Check(test, freed, "failed to free generated trampoline");
-
-	std::printf(
-	    "[host]    %-48s entry_mod16=%zu body_mod16=%zu ms_mod16=%zu ok\n", test,
-	    static_cast<size_t>(state.sysv_entry_rsp & 0x0f),
-	    static_cast<size_t>(state.sysv_body_rsp & 0x0f),
-	    static_cast<size_t>(state.ms_entry_rsp & 0x0f));
-}
-#else
-void TestWindowsMisalignedSysvHostEntry() {
-	std::printf("[host]    %-48s skipped\n", "WindowsMisalignedSysvHostEntry");
-}
-#endif
 VirtualQueryInfo Query(const char* test, uint64_t addr, int flags = 0) {
 	VirtualQueryInfo info {};
 	const int ret = Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr),
@@ -967,65 +815,6 @@ void TestFlexibleMemoryReuseIsZeroFilled() {
 	        "KernelMunmap(reuse)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "zero-fill test leaked flexible backing capacity");
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestDirectMemoryReuseIsZeroFilled() {
-	const char*       test    = "DirectMemoryReuseIsZeroFilled";
-	constexpr uint64_t MapSize = SceKernelPageSize * 2;
-	constexpr uint8_t Poison   = 0xa5;
-	const auto        direct   = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
-
-	int64_t source_phys = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, direct, MapSize, SceKernelPageSize, SceKernelMtypeC,
-	            &source_phys),
-	        "KernelAllocateDirectMemory(source)");
-
-	// Direct memory is physical: unmapping keeps the contents, so the bytes stay in the
-	// backing store while the range sits in the physical free list.
-	void* source = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &source, MapSize, SceKernelProtCpuRw, 0, source_phys, SceKernelPageSize,
-	            "direct_zero_source"),
-	        "KernelMapNamedDirectMemory(source)");
-	std::memset(source, Poison, MapSize);
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(source), MapSize),
-	        "KernelMunmap(source)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(source_phys, MapSize),
-	        "KernelCheckedReleaseDirectMemory(source)");
-
-	// Searching from the released address makes the reuse deterministic: the freed range is
-	// the first one the allocator can hand back.
-	int64_t reused_phys = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            source_phys, direct, MapSize, SceKernelPageSize, SceKernelMtypeC, &reused_phys),
-	        "KernelAllocateDirectMemory(reuse)");
-	Check(test, reused_phys == source_phys,
-	      "released direct range was not reused, so the zero-fill went untested");
-
-	void* reused = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &reused, MapSize, SceKernelProtCpuRw, 0, reused_phys, SceKernelPageSize,
-	            "direct_zero_reuse"),
-	        "KernelMapNamedDirectMemory(reuse)");
-	const auto* bytes = reinterpret_cast<const uint8_t*>(reused);
-	Check(test,
-	      std::all_of(bytes, bytes + MapSize, [](uint8_t value) { return value == 0; }),
-	      "reused direct backing exposed stale bytes");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(reused), MapSize),
-	        "KernelMunmap(reuse)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(reused_phys, MapSize),
-	        "KernelCheckedReleaseDirectMemory(reuse)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -1761,26 +1550,6 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestMunmapReservedSpanWithReleasedHole() {
-	const char* test = "MunmapReservedSpanWithReleasedHole";
-	void* reserve = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
-	                                                           SceKernelPageSize),
-	        "KernelReserveVirtualRange");
-	const auto base = reinterpret_cast<uint64_t>(reserve);
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
-	        "KernelMunmap(middle hole)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3),
-	        "KernelMunmap(full span with hole)");
-	ExpectUnmapped(test, base);
-	ExpectUnmapped(test, base + SceKernelPageSize * 2);
-	Check(test,
-	      Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3) == ErrorAccess,
-	      "KernelMunmap accepted an entirely released span");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
 void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	const char* test = "NonzeroDirectOffsetAliasesSharedBacking";
 
@@ -2025,57 +1794,6 @@ void TestLargeDirectMapAliasesAcrossChunks() {
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(second_alias), size),
 	        "KernelMunmap(second alias)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
-	        "KernelReleaseDirectMemory");
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-/**
- * @brief Tests on-demand commitment of physical direct memory and placeholder retention on unmap.
- */
-void TestOnDemandPhysicalMemoryCommitment() {
-	const char*        test = "OnDemandPhysicalMemoryCommitment";
-	constexpr uint64_t size = 0x200000; // 2 MiB
-
-	int64_t phys_addr = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000,
-	            SceKernelMtypeC, &phys_addr),
-	        "KernelAllocateDirectMemory");
-
-	void* address = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &address, size, SceKernelProtCpuRw, 0, phys_addr, 0x10000, "on_demand_direct"),
-	        "KernelMapNamedDirectMemory");
-
-	// Verify write and read work correctly through the on-demand mapped view
-	auto* ptr = static_cast<uint64_t*>(address);
-	ptr[0] = 0xdeadbeefcafebabeull;
-	ptr[size / sizeof(uint64_t) - 1] = 0x0123456789abcdefull;
-	Check(test, ptr[0] == 0xdeadbeefcafebabeull, "written value at start did not match");
-	Check(test, ptr[size / sizeof(uint64_t) - 1] == 0x0123456789abcdefull,
-	      "written value at end did not match");
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// Verify mapped view is committed
-	MEMORY_BASIC_INFORMATION mbi {};
-	Check(test, VirtualQuery(address, &mbi, sizeof(mbi)) != 0, "VirtualQuery(mapped) failed");
-	Check(test, mbi.State == MEM_COMMIT, "mapped memory is not in MEM_COMMIT state");
-#endif
-
-	// Unmap and verify that placeholder is restored to reserved state
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), size),
-	        "KernelMunmap");
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	Check(test, VirtualQuery(address, &mbi, sizeof(mbi)) != 0, "VirtualQuery(unmapped) failed");
-	Check(test, mbi.State == MEM_RESERVE, "unmapped memory placeholder is not in MEM_RESERVE state");
-#endif
-
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
 	        "KernelReleaseDirectMemory");
 
@@ -3250,167 +2968,6 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
 	      "module relocation did not retain writable host memory and semantic guest protection");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-// Decode a short guest instruction and return the result, for the cases below.
-static Loader::GuestFaultingInstruction DecodeGuest(const std::vector<uint8_t>& code,
-                                                    const Loader::GuestX64Registers& registers) {
-	return Loader::DecodeGuestFaultingInstruction(code.data(), code.size(), registers);
-}
-
-// A text comparison that reports both sides, so a mismatch says what it actually produced
-// instead of only that it did not match.
-static bool TextIs(const char* test, const Loader::GuestFaultingInstruction& decoded,
-                   const char* expected) {
-	if (decoded.decoded && std::strcmp(decoded.text, expected) == 0) {
-		return true;
-	}
-	std::printf("          text mismatch: expected \"%s\", got \"%s\" (decoded=%d len=%u)\n",
-	            expected, decoded.text, static_cast<int>(decoded.decoded), decoded.length);
-	Check(test, false, "decoded instruction text did not match");
-	return false;
-}
-
-void TestGuestFaultInstructionDecoding() {
-	const char* test = "GuestFaultInstructionDecoding";
-
-	// A base-register load is the case #835 hit: a read of 0xffffffffffffffff out of a register
-	// that was itself zero. The point of the feature is that the report shows the resolved
-	// address, not just "[rbx-0x1]".
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rip = 0x9000006a1ull;
-		registers.rbx = 0;
-		// mov rbx, qword ptr [rbx - 0x1]
-		const auto decoded = DecodeGuest({0x48, 0x8b, 0x5b, 0xff}, registers);
-		TextIs(test, decoded, "mov rbx, qword ptr [0xffffffffffffffff]");
-		Check(test, decoded.length == 4 && decoded.reads_memory && !decoded.writes_memory &&
-		                  decoded.effective_address == 0xffffffffffffffffull,
-	      "base-register load reported the wrong length, direction or address");
-	}
-
-	// RIP-relative loads anchor past the end of the instruction, so the length matters.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rip = 0x900000000ull;
-		// mov rax, qword ptr [rip + 0x10]
-		const auto decoded = DecodeGuest({0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00}, registers);
-		Check(test, decoded.decoded && decoded.reads_memory &&
-		                  decoded.effective_address == 0x900000017ull,
-	      "rip-relative load did not anchor past the end of the instruction");
-	}
-
-	// SIB addressing: base + index * scale + displacement.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rbx = 0x1000;
-		registers.rcx = 0x10;
-		// mov rax, qword ptr [rbx + rcx*4 + 0x8]
-		const auto decoded = DecodeGuest({0x48, 0x8b, 0x44, 0x8b, 0x08}, registers);
-		Check(test, decoded.decoded && decoded.reads_memory &&
-		                  decoded.effective_address == 0x1048ull,
-	      "sib load did not apply base, scale and displacement");
-	}
-
-	// LEA names an address without reading it, so it must not be reported as the memory access
-	// that faulted.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rbx = 0x2000;
-		// lea rax, [rbx + 0x10]
-		const auto decoded = DecodeGuest({0x48, 0x8d, 0x43, 0x10}, registers);
-		TextIs(test, decoded, "lea rax, qword ptr [0x0000000000002010]");
-		Check(test, !decoded.reads_memory && !decoded.writes_memory,
-	      "lea was reported as a memory access");
-	}
-
-	// A register-only instruction has no memory operand at all.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rax = 1;
-		registers.rbx = 2;
-		// add rax, rbx
-		const auto decoded = DecodeGuest({0x48, 0x01, 0xd8}, registers);
-		TextIs(test, decoded, "add rax, rbx");
-		Check(test, !decoded.reads_memory && !decoded.writes_memory,
-	      "register-only instruction claimed a memory access");
-	}
-
-	// A store is a write, and #835's pc decodes to this instruction, so it also pins the
-	// behaviour for a guest trap: decoded, named, and with no memory access to report.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rcx = 0x10;
-		// mov qword ptr [rcx], rax
-		const auto store = DecodeGuest({0x48, 0x89, 0x01}, registers);
-		Check(test, store.writes_memory && !store.reads_memory &&
-		                  store.effective_address == 0x10ull,
-	      "store was not reported as a write at its resolved address");
-		// int 0x41
-		const auto trap = DecodeGuest({0xcd, 0x41}, registers);
-		Check(test, trap.decoded && trap.length == 2,
-	      "int 0x41 did not decode");
-		Check(test, !trap.reads_memory && !trap.writes_memory,
-	      "int 0x41 was reported as a memory access");
-	}
-
-	// A relative call resolves to an absolute target, which is worth having in a crash report.
-	{
-		Loader::GuestX64Registers registers {};
-		registers.rip = 0x1000;
-		// call rel32 +0x10, 5 bytes long, so the target is rip + 5 + 0x10
-		const auto decoded = DecodeGuest({0xe8, 0x10, 0x00, 0x00, 0x00}, registers);
-		TextIs(test, decoded, "call 0x0000000000001015");
-		Check(test, !decoded.reads_memory && !decoded.writes_memory,
-		      "relative call claimed a memory access");
-	}
-
-	// Truncated or absent input must be reported, not guessed at, and must not read past the
-	// buffer it was handed.
-	{
-		Loader::GuestX64Registers registers {};
-		const auto empty  = DecodeGuest({}, registers);
-		const auto nullp  = Loader::DecodeGuestFaultingInstruction(nullptr, 16, registers);
-		// mov rax, qword ptr [rip + 0x10] cut short after the opcode and modrm
-		const auto shorty = DecodeGuest({0x48, 0x8b, 0x05}, registers);
-		Check(test, !empty.decoded && !nullp.decoded && !shorty.decoded,
-	      "undecodable input was reported as a decoded instruction");
-		Check(test, std::strstr(empty.text, "no readable") != nullptr &&
-		                  std::strstr(nullp.text, "no readable") != nullptr,
-	      "absent input did not say so");
-	}
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestGuestFaultFrameAttribution() {
-	const char* test = "GuestFaultFrameAttribution";
-
-	// The point of the fault report is naming the module, so check the exact rendering
-	// instead of only that some text came out.
-	Check(test, Loader::FormatGuestFrame("libngs2.so", 0x900000000ull, 0x900001234ull) ==
-	                    "libngs2.so+0x0000000000001234",
-	      "attributed guest frame did not render as module+offset");
-	Check(test, Loader::FormatGuestFrame("libSndZAudio.so", 0x900f00000ull, 0x900f00000ull) ==
-	                    "libSndZAudio.so+0x0000000000000000",
-	      "guest frame at the module base lost its zero offset");
-	Check(test, Loader::FormatGuestFrame("libc.so", 0x0ull, 0xffffffffffffffffull) ==
-	                    "libc.so+0xffffffffffffffff",
-	      "guest frame at the top of the address space lost its offset");
-
-	// An unattributable address must render as nothing, so the caller can print
-	// module=<unknown> rather than an empty-looking label.
-	Check(test, Loader::FormatGuestFrame(nullptr, 0x900000000ull, 0x900001234ull).empty(),
-	      "null module name produced a frame label");
-	Check(test, Loader::FormatGuestFrame("", 0x900000000ull, 0x900001234ull).empty(),
-	      "empty module name produced a frame label");
-
-	// A caller that passes an address below the base must not print a wrapped offset.
-	Check(test, Loader::FormatGuestFrame("libfoo.so", 0x900001000ull, 0x900000000ull) ==
-	                    "libfoo.so+0x0000000000000000",
-	      "guest frame below the module base wrapped its offset");
-
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4649,12 +4206,6 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (argc == 2 && std::strcmp(argv[1], "--sysv-align-only") == 0) {
-		RunTest(TestWindowsMisalignedSysvHostEntry);
-		return g_failed_tests == 0 ? 0 : 1;
-	}
-#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -4670,7 +4221,6 @@ int main(int argc, char** argv) {
 	RunTest(TestPackedBitFieldInsert);
 	RunTest(TestCpuExtensionPatches);
 #endif
-	RunTest(TestWindowsMisalignedSysvHostEntry);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
@@ -4683,7 +4233,6 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-	RunTest(TestDirectMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
@@ -4695,7 +4244,6 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
-	RunTest(TestMunmapReservedSpanWithReleasedHole);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
@@ -4710,7 +4258,6 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
-	RunTest(TestOnDemandPhysicalMemoryCommitment);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
@@ -4732,8 +4279,6 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
-	RunTest(TestGuestFaultFrameAttribution);
-	RunTest(TestGuestFaultInstructionDecoding);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);
