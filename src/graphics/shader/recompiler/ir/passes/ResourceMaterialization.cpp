@@ -1100,54 +1100,16 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 /// the buffer, image and sampler descriptors of this call and `specialization` with the properties
 /// that select the shader permutation. Returns false when a value could not be read or a descriptor
 /// cannot be expressed; the caller must not use a failed result.
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          RawDescriptors* /*raw*/) {
-	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
-	}
-	const bool capture_reads = program.capture_specialization_reads;
-	auto&      reads         = snapshot.specialization_reads;
-	reads.clear();
-	ReadCapture capture {runtime, reads};
-	SrtRuntime  observed = runtime;
-	if (capture_reads) {
-		observed.userdata = &capture;
-		observed.read_specialization_memory =
-		    runtime.read_specialization_memory != nullptr ? CaptureStrictRead : nullptr;
-		observed.read_memory = CaptureOrdinaryRead;
-	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
-	}
-	const auto active             = std::span<const uint8_t>(program.active_sources);
-	snapshot.uniform_fill         = {};
-	const auto&             fill  = program.uniform_fill;
-	const auto              words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	bool                    uniform_fill = words != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
-		snapshot.uniform_fill       = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
-	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
-		if (source >= program.descriptor_sources.size()) {
-			return false;
-		}
-		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
-		}
-		value             = {};
-		value.dword_count = program.descriptor_sources[source].dword_count;
-		return true;
-	};
+// The descriptor half of resource materialization: each buffer, image and sampler descriptor is
+// obtained through evaluate(kind, index, source, value, written) (kind 0 buffer, 1 image,
+// 2 sampler; it returns zero dwords for inactive sources), then validated, and the specialization
+// is built. Indirect descriptors are evaluated here through observed and clean. Fresh evaluation
+// and rematerialization share this code so they cannot drift apart.
+template <typename Evaluate>
+static bool MaterializeDescriptors(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   std::span<const uint8_t> active, const SrtRuntime* observed,
+                                   SrtWalker* clean, ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization, Evaluate&& evaluate) {
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1161,13 +1123,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					EXIT_IF(observed == nullptr || clean == nullptr);
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
+					        program, *source->indirect_descriptor, i, 4u, *observed, *clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
+			} else if (!evaluate(0u, i, base.source, snapshot.buffers[i], base.written)) {
 				return false;
 			}
 		}
@@ -1221,8 +1184,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect      = *source->indirect_descriptor;
 			const bool  bounded_table = IsBoundedDescriptorTable(program, indirect);
+			EXIT_IF(observed == nullptr || clean == nullptr);
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
+			        program, indirect, i, 8u, *observed, *clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) ||
@@ -1235,7 +1199,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				return false;
 			}
 		} else {
-			if (!evaluate(image.source, snapshot.images[i], image.written)) {
+			if (!evaluate(1u, i, image.source, snapshot.images[i], image.written)) {
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
@@ -1259,7 +1223,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+		if (!evaluate(2u, i, program.info.samplers[i].source, snapshot.samplers[i], false)) {
 			return false;
 		}
 		if (program.info.samplers[i].gather_lod) {
@@ -1275,6 +1239,74 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          RawDescriptors* raw) {
+	if (!program.resource_tracking_complete ||
+	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+		return false;
+	}
+	const bool capture_reads = program.capture_specialization_reads;
+	auto&      reads         = snapshot.specialization_reads;
+	reads.clear();
+	ReadCapture capture {runtime, reads};
+	SrtRuntime  observed = runtime;
+	if (capture_reads) {
+		observed.userdata = &capture;
+		observed.read_specialization_memory =
+		    runtime.read_specialization_memory != nullptr ? CaptureStrictRead : nullptr;
+		observed.read_memory = CaptureOrdinaryRead;
+	}
+	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker walker(program, observed, program.clean_flat_slots,
+	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+		return false;
+	}
+	const auto active             = std::span<const uint8_t>(program.active_sources);
+	snapshot.uniform_fill         = {};
+	const auto&             fill  = program.uniform_fill;
+	const auto              words = fill.fill.words;
+	std::array<uint32_t, 4> stored {};
+	bool                    uniform_fill = words != 0;
+	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+	}
+	if (uniform_fill) {
+		snapshot.uniform_fill       = fill.fill;
+		snapshot.uniform_fill.value = stored[0];
+	}
+	const auto evaluate_source = [&](uint32_t source, DescriptorValue& value, bool written) {
+		if (source >= program.descriptor_sources.size()) {
+			return false;
+		}
+		if (active.empty() || active[source]) {
+			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+		}
+		value             = {};
+		value.dword_count = program.descriptor_sources[source].dword_count;
+		return true;
+	};
+	if (raw != nullptr) {
+		raw->active.assign(active.begin(), active.end());
+		raw->buffers.assign(program.info.buffers.size(), {});
+		raw->images.assign(program.info.images.size(), {});
+		raw->samplers.assign(program.info.samplers.size(), {});
+	}
+	return MaterializeDescriptors(
+	    program, runtime, active, &observed, &clean, snapshot, specialization,
+	    [&](uint32_t kind, uint32_t index, uint32_t source, DescriptorValue& value, bool written) {
+		    if (!evaluate_source(source, value, written)) {
+			    return false;
+		    }
+		    if (raw != nullptr) {
+			    auto& list = kind == 0u ? raw->buffers : kind == 1u ? raw->images : raw->samplers;
+			    list[index] = value;
+		    }
+		    return true;
+	    });
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1480,16 +1512,50 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	image_remap.Apply(images);
 }
 
-// Rematerialization from raw descriptors is not ported to the current materialization (which
-// validates and specializes differently); callers then key their caches on every input instead.
-bool SupportsRematerialize(const ResourcePlan& /*program*/) {
-	return false;
+bool SupportsRematerialize(const ResourcePlan& program) {
+	if (!program.resource_tracking_complete || program.capture_specialization_reads) {
+		return false;
+	}
+	// Indirect descriptors are evaluated during validation, from guest memory, so their results
+	// are not a function of the raw descriptors alone.
+	const auto direct = [&](uint32_t source) {
+		return source < program.descriptor_sources.size() &&
+		       !program.descriptor_sources[source].indirect_descriptor.has_value();
+	};
+	for (const auto& buffer: program.info.buffers) {
+		if (!direct(buffer.source)) {
+			return false;
+		}
+	}
+	for (const auto& image: program.info.images) {
+		if (!direct(image.source)) {
+			return false;
+		}
+	}
+	for (const auto& sampler: program.info.samplers) {
+		if (!direct(sampler.source)) {
+			return false;
+		}
+	}
+	return true;
 }
 
-bool RematerializeResources(const ResourcePlan& /*program*/, const SrtRuntime& /*runtime*/,
-                            const RawDescriptors& /*raw*/, ResourceSnapshot& /*snapshot*/,
-                            ResourceSpecialization& /*specialization*/) {
-	return false;
+bool RematerializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                            const RawDescriptors& raw, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (!SupportsRematerialize(program) || raw.buffers.size() != program.info.buffers.size() ||
+	    raw.images.size() != program.info.images.size() ||
+	    raw.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	return MaterializeDescriptors(
+	    program, runtime, raw.active, nullptr, nullptr, snapshot, specialization,
+	    [&](uint32_t kind, uint32_t index, uint32_t /*source*/, DescriptorValue& value,
+	        bool /*written*/) {
+		    const auto& list = kind == 0u ? raw.buffers : kind == 1u ? raw.images : raw.samplers;
+		    value            = list[index];
+		    return true;
+	    });
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
