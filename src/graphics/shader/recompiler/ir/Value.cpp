@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/Value.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <cstring>
@@ -203,7 +204,7 @@ Block* Inst::Parent() const {
 	return parent;
 }
 
-const std::vector<Use>& Inst::Uses() const {
+const UseList& Inst::Uses() const {
 	return uses;
 }
 
@@ -216,15 +217,19 @@ void Inst::SetArg(size_t index, Value value) {
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
+	StoreArg(index, value);
+	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
+		AddUse(new_inst, index);
+	}
+}
+
+void Inst::StoreArg(size_t index, Value value) {
 	if (num_args <= InlineArity) {
 		fixed_args[index] = value;
 	} else if (num_args == PhiArity) {
 		phi_args[index].second = value;
 	} else {
 		large_args[index] = value;
-	}
-	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
-		AddUse(new_inst, index);
 	}
 }
 
@@ -238,9 +243,17 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Retarget every user directly: SetArg per user would search this list to remove each entry
+	// (quadratic for widely used values), and all of them go anyway. Users get the replacement's
+	// uses in the same order SetArg would have added them.
+	const auto old_uses = std::move(uses);
+	uses.clear();
+	auto* const replacement_inst = replacement.TryInstruction();
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		use.user->StoreArg(use.operand, replacement);
+		if (replacement_inst != nullptr) {
+			use.user->AddUse(replacement_inst, use.operand);
+		}
 	}
 	Invalidate();
 	if (preserve) {
@@ -256,9 +269,12 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	// Integrity check (a linear search per use): with the other IR validation.
+	if (ProgramValidationEnabled()) {
+		const auto found = std::ranges::find_if(
+		    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
+		EXIT_IF(found != used->uses.end());
+	}
 	used->uses.push_back({this, operand});
 }
 
