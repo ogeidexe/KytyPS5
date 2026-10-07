@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
 #include <mutex>
 #include <utility>
 
@@ -41,7 +43,11 @@ public:
 			// costing the majority of a run's CPU time. PAUSE also backs off the retry rate
 			// instead of hammering the coherency bus at full clock speed every iteration.
 			while (m_lock.test(std::memory_order_relaxed)) {
+#if defined(__x86_64__) || defined(_M_X64)
 				_mm_pause();
+#elif defined(__aarch64__)
+				__asm__ __volatile__("yield");
+#endif
 			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);

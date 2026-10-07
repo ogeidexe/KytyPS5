@@ -1214,7 +1214,7 @@ static void ApplyHostThreadAffinity(Pthread thread) {
 		}
 	}
 }
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 static void ApplyHostThreadAffinity(Pthread thread) {
 	if (thread == nullptr || thread->attr == nullptr) {
 		return;
@@ -3686,7 +3686,7 @@ int KYTY_SYSV_ABI PthreadGetCurrentCpu() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return static_cast<int>(GetCurrentProcessorNumber() % 14);
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	int cpu = sched_getcpu();
 	return cpu >= 0 ? (cpu % 14) : 0;
 #else

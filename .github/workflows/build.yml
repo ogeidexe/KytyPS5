@@ -138,6 +138,8 @@ jobs:
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
+    # macOS builds are paused on this fork for now; remove this line to re-enable them.
+    if: false
     runs-on: macos-15
 
     steps:
