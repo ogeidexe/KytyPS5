@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <source_location>
 #include <array>
 #include <optional>
 #include <span>
@@ -112,7 +113,8 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	// where: the caller, recorded by GpuPassProfiler when a pass on the same targets restarts.
+	void EndRendering(std::source_location where = std::source_location::current()) const;
 
 	// Records into the Vulkan command buffer directly, or into the stream the recording thread
 	// replays (CommandScheduler with asynchronous recording).
@@ -149,6 +151,10 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable uint32_t    m_pass_token  = UINT32_MAX; // GpuPassProfiler bracket of the open pass
+	mutable RenderState m_ended_state;              // GpuPassProfiler: the last pass ended and by whom
+	mutable std::source_location m_ended_where;
+	mutable bool        m_ended_valid = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

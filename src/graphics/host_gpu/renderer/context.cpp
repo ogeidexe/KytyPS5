@@ -8,11 +8,13 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuPassProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <string>
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -77,6 +79,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	if (GpuPassProfiler::Enabled() && m_ended_valid && m_ended_state == state) {
+		GpuPassProfiler::NoteRestart(m_ended_where);
+	}
 	Common::FrameStats::g_render_passes.fetch_add(1, std::memory_order_relaxed);
 	Common::FrameStats::StoreMax(Common::FrameStats::g_render_max_width, state.width);
 	Common::FrameStats::StoreMax(Common::FrameStats::g_render_max_height, state.height);
@@ -119,6 +124,19 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	if (GpuPassProfiler::Enabled()) {
+		const uint64_t key = (uint64_t {1} << 63u) | (uint64_t {state.width} << 40u) |
+		                     (uint64_t {state.height} << 20u) |
+		                     (uint64_t {state.num_layers & 0xffu} << 8u) |
+		                     (uint64_t {state.num_color_attachments} << 4u) |
+		                     (depth_stencil.has_depth ? 1u : 0u);
+		m_pass_token = GpuPassProfiler::Begin(
+		    *this, key,
+		    "pass " + std::to_string(state.width) + "x" + std::to_string(state.height) +
+		        " colors=" + std::to_string(state.num_color_attachments) +
+		        (depth_stencil.has_depth ? " depth" : "") +
+		        (state.num_layers > 1 ? " layers=" + std::to_string(state.num_layers) : ""));
+	}
 	Handle().beginRendering(rendering);
 	if (depth_stencil.has_depth) {
 		ImageHistory::Record({m_debug_submit_id, ImageHistory::Kind::BeginRendering, VK_NULL_HANDLE,
@@ -130,11 +148,18 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering    = true;
 }
 
-void CommandBuffer::EndRendering() const {
+void CommandBuffer::EndRendering(std::source_location where) const {
 	if (!m_rendering) {
 		return;
 	}
+	if (GpuPassProfiler::Enabled()) {
+		m_ended_state = m_render_state;
+		m_ended_where = where;
+		m_ended_valid = true;
+	}
 	Handle().endRendering();
+	GpuPassProfiler::End(*this, m_pass_token);
+	m_pass_token   = UINT32_MAX;
 	m_rendering    = false;
 	m_render_state = {};
 }

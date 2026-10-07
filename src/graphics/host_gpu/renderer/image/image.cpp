@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuPassProfiler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageHistory.h"
 
@@ -247,6 +248,13 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		return;
 	}
 	Common::FrameStats::g_barriers_image_transit.fetch_add(1, std::memory_order_relaxed);
+	if (GpuPassProfiler::Enabled()) {
+		GpuPassProfiler::NoteTransition(vk::to_string(barriers.front().oldLayout) + "->" +
+		                                vk::to_string(barriers.front().newLayout) +
+		                                (info.IsVolume() ? " 3d" : "") + " " +
+		                                std::to_string(info.extent.width) + "x" +
+		                                std::to_string(info.extent.height));
+	}
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());

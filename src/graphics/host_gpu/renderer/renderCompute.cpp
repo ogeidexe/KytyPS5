@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuPassProfiler.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -26,6 +27,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <fmt/format.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -576,7 +578,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const auto pass_token =
+	    GpuPassProfiler::Enabled()
+	        ? GpuPassProfiler::Begin(buffer, program.shader_hash & ~(uint64_t {1} << 63u),
+	                                 fmt::format("cs {:016x}", program.shader_hash))
+	        : UINT32_MAX;
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	GpuPassProfiler::End(buffer, pass_token);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	// Record the barrier before the after-dispatch snapshot: DumpDispatchBuffers calls

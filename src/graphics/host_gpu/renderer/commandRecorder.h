@@ -527,6 +527,9 @@ public:
 	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
 		Run([=](vk::CommandBuffer c) { c.beginQuery(pool, query, flags); });
 	}
+	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer c) { c.writeTimestamp(stage, pool, query); });
+	}
 	void endQuery(vk::QueryPool pool, uint32_t query) const {
 		Run([=](vk::CommandBuffer c) { c.endQuery(pool, query); });
 	}
