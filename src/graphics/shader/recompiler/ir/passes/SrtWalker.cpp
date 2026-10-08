@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_set>
@@ -22,6 +23,12 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+
+// KYTY_SRT_FAST_PATHS=0 evaluates every SRT read and descriptor dword by walking the IR.
+bool g_srt_fast_paths = [] {
+	const char* value = std::getenv("KYTY_SRT_FAST_PATHS");
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}();
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -68,6 +75,63 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 		if (inst.Arg(arg).Resolve() != Value(0u)) return false;
 	}
 	return true;
+}
+
+// Fills ResourcePlan::direct_srt_reads and flat_slots_identity (they depend on the plan only).
+void PrepareDirectSrtReads(const ResourcePlan& program) {
+	if (program.direct_srt_reads_ready &&
+	    program.direct_srt_reads.size() == program.srt_reads.size()) {
+		return;
+	}
+	program.direct_srt_reads_ready = true;
+	program.direct_srt_reads.assign(program.srt_reads.size(), {});
+	program.flat_slots_identity = true;
+	for (size_t i = 0; i < program.srt_reads.size(); ++i) {
+		if (program.srt_reads[i].flat_offset != i) {
+			program.flat_slots_identity = false;
+		}
+		// The shape EvaluateRawRead handles for LoadAddressU32, with every operand fixed but the
+		// two user data words of the address.
+		auto* const inst = program.srt_reads[i].value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    !IsRawRead(program, *inst) || inst->NumArgs() < 2) {
+			continue;
+		}
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->NumArgs() < 2) {
+			continue;
+		}
+		const auto lo     = PassThroughUserData(program, handle->Arg(0));
+		const auto hi     = PassThroughUserData(program, handle->Arg(1));
+		const auto offset = inst->Arg(1).Resolve();
+		if (lo == UINT32_MAX || hi == UINT32_MAX || !offset.IsImmediate() ||
+		    offset.GetType() != Type::U32) {
+			continue;
+		}
+		const auto& mem       = program.memory_info[inst->Flags<MemoryFlags>().index];
+		const auto  immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+		program.direct_srt_reads[i] = {
+		    .memo_index   = inst->EvaluationIndex(program.evaluation_value_count),
+		    .user_data_lo = lo,
+		    .user_data_hi = hi,
+		    .relative = (immediate & ~int64_t {3}) + static_cast<int64_t>(offset.U32() & ~3u),
+		};
+	}
+}
+
+// The SRT read a value copies as-is (ReadConst of a constant slot, as EvaluateInst evaluates
+// it), or UINT32_MAX.
+uint32_t ConstantFlatSlot(const ResourcePlan& program, Value value) {
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst || inst->NumArgs() < 2) {
+		return UINT32_MAX;
+	}
+	const auto slot = inst->Arg(1).Resolve();
+	if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+	    slot.U32() >= program.srt_reads.size()) {
+		return UINT32_MAX;
+	}
+	return slot.U32();
 }
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
@@ -324,6 +388,10 @@ private:
 
 } // namespace
 
+void SetSrtFastPaths(bool enabled) {
+	g_srt_fast_paths = enabled;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
                      Value active_mask)
@@ -533,6 +601,62 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	result = word;
+	return true;
+}
+
+// EvaluateWide of a direct SRT read (ResourcePlan::DirectSrtRead) without walking its IR: the
+// memo entry, user data reads, address arithmetic and memory access of EvaluateRawRead.
+bool SrtWalker::EvaluateDirectRead(const ResourcePlan::DirectSrtRead& read, uint64_t& result) {
+	const auto index = read.memo_index;
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	if (m_context.values[index].generation == m_context.generation) {
+		result = m_context.values[index].value;
+		return true;
+	}
+	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+		return false;
+	}
+	const auto fail = [&] {
+		m_context.values[index].generation = 0;
+		return false;
+	};
+	const auto& user_data = m_runtime.user_data;
+	if (read.user_data_lo >= user_data.size()) {
+		return fail();
+	}
+	if (m_runtime.observe_user_data != nullptr) {
+		m_runtime.observe_user_data(read.user_data_lo);
+	}
+	if (read.user_data_hi >= user_data.size()) {
+		return fail();
+	}
+	if (m_runtime.observe_user_data != nullptr) {
+		m_runtime.observe_user_data(read.user_data_hi);
+	}
+	const uint64_t low  = user_data[read.user_data_lo];
+	const uint64_t high = user_data[read.user_data_hi];
+	const auto     base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	uint64_t       address = 0;
+	if (!AddSignedAddress(base & ~uint64_t {3}, read.relative, address)) {
+		return fail();
+	}
+	uint32_t word = 0;
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			return fail();
+		}
+	} else {
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (m_runtime.observe_raw_read != nullptr) {
+			m_runtime.observe_raw_read(address, word);
+		}
+	}
+	auto& memo      = m_context.values[index];
+	memo.value      = word;
+	memo.generation = m_context.generation;
+	result          = word;
 	return true;
 }
 
@@ -929,13 +1053,17 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (m_program.pass_through_ready.size() != m_program.descriptor_sources.size()) {
 		m_program.pass_through_ready.assign(m_program.descriptor_sources.size(), 0u);
 		m_program.pass_through_dwords.resize(m_program.descriptor_sources.size());
+		m_program.flat_slot_dwords.resize(m_program.descriptor_sources.size());
 	}
 	auto& pass_through = m_program.pass_through_dwords[source];
+	auto& flat_slots   = m_program.flat_slot_dwords[source];
 	if (m_program.pass_through_ready[source] == 0u) {
 		pass_through.fill(UINT32_MAX);
+		flat_slots.fill(UINT32_MAX);
 		for (uint32_t index = 0; index < descriptor.dword_count && index < pass_through.size();
 		     ++index) {
 			pass_through[index] = PassThroughUserData(m_program, descriptor.dwords[index]);
+			flat_slots[index]   = ConstantFlatSlot(m_program, descriptor.dwords[index]);
 		}
 		m_program.pass_through_ready[source] = 1u;
 	}
@@ -955,6 +1083,14 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 			result.dwords[index] = m_runtime.user_data[k];
 			continue;
 		}
+		// ReadConst of slot k evaluates SRT read k in the evaluator RefreshFlatBuffer used for
+		// it, whose memo holds exactly the word it stored in flat slot k (when it refreshed k).
+		if (const auto slot = index < flat_slots.size() ? flat_slots[index] : UINT32_MAX;
+		    slot != UINT32_MAX && m_flat != nullptr && g_srt_fast_paths &&
+		    slot < m_program.refreshed_slots.size() && m_program.refreshed_slots[slot] != 0u) {
+			result.dwords[index] = (*m_flat)[slot];
+			continue;
+		}
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
 		}
@@ -963,7 +1099,11 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	m_flat = nullptr;
 	if (!m_program.srt_plan_complete) return false;
+	PrepareDirectSrtReads(m_program);
+	auto& refreshed = m_program.refreshed_slots;
+	refreshed.assign(m_program.srt_reads.size(), 0u);
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -972,7 +1112,17 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) return false;
+		const auto& direct = m_program.direct_srt_reads[slot];
+		uint64_t    value  = 0;
+		const bool  evaluated = direct.memo_index != UINT32_MAX && g_srt_fast_paths &&
+		                               evaluator.m_active_mask.IsEmpty()
+		                            ? evaluator.EvaluateDirectRead(direct, value)
+		                            : evaluator.EvaluateWide(read.value, value);
+		if (!evaluated) return false;
+		flat[read.flat_offset] = static_cast<uint32_t>(value);
+		refreshed[slot]        = 1u;
+		return true;
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -981,6 +1131,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 			if (!refresh(slot)) return false;
 		}
+		if (m_program.flat_slots_identity) m_flat = &flat;
 		return true;
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
@@ -1012,6 +1163,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
+	if (m_program.flat_slots_identity) m_flat = &flat;
 	return true;
 }
 

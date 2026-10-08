@@ -33,6 +33,9 @@ enum class RuntimeValueType { Any, Integer };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+// Whether SRT evaluation takes its direct paths for flattened-SRT reads and descriptor dwords
+// (identical results; KYTY_SRT_FAST_PATHS=0 starts with them off). GPU thread only.
+void SetSrtFastPaths(bool enabled);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 // The user data index a descriptor dword copies verbatim (the value is GetUserData itself), or
@@ -66,6 +69,7 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateDirectRead(const ResourcePlan::DirectSrtRead& read, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -74,6 +78,8 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// The flat SRT buffer this session's RefreshFlatBuffer filled, once it succeeded.
+	const std::vector<uint32_t>*     m_flat = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
