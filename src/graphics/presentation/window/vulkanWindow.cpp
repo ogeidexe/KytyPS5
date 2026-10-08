@@ -505,6 +505,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	features12.hostQueryReset           = supported_features12.hostQueryReset;
+	graphics.host_query_reset_enabled   = features12.hostQueryReset == VK_TRUE;
+	graphics.calibrated_timestamps_enabled =
+	    HasExtension(device_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 	if (std::getenv("KYTY_BDA_CAPTURE_REPLAY") != nullptr) {
 		// Diagnostics only: buffer device addresses a capture/replay tool (GFXReconstruct) can
 		// reproduce. Device-address buffers and their memory get the capture-replay flags.
@@ -1089,6 +1093,7 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,

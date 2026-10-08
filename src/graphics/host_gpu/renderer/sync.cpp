@@ -11,8 +11,15 @@
 #include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
+#include "kernel/memory.h"
+#include "common/timer.h"
 #include "libs/errno.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <vector>
 #include <cstring>
 #include <limits>
 
@@ -51,6 +58,176 @@ uint64_t ReadReferenceClock() {
 		     host_frequency);
 	}
 	return value;
+}
+
+namespace {
+
+// GPU timestamps of guest timestamp writes: a ring of queries, each reset on the host after its
+// value has been read (hostQueryReset), so recording needs no reset command (which a render pass
+// would have to end for).
+struct GpuTimestampState {
+	vk::Device                     device      = nullptr;
+	vk::QueryPool                  pool        = nullptr;
+	double                         ns_per_tick = 1.0;
+	uint64_t                       valid_mask  = ~uint64_t {0};
+	PFN_vkGetCalibratedTimestampsEXT get_calibrated = nullptr;
+	uint32_t                       next        = 0;
+	std::vector<std::atomic<uint8_t>> busy;
+	// Calibration: a GPU timestamp and the host TSC at the same moment.
+	std::mutex                     calibration_mutex;
+	uint64_t                       calibrated_gpu = 0;
+	uint64_t                       calibrated_tsc = 0;
+	uint64_t                       calibrated_at  = 0; // TSC of the last calibration
+	bool                           disabled       = false;
+};
+
+constexpr uint32_t GpuTimestampSlots = 4096;
+
+GpuTimestampState& GpuTimestamps() {
+	static GpuTimestampState state;
+	return state;
+}
+
+bool GpuTimestampsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_TIMESTAMPS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool InitGpuTimestamps(GraphicContext& graphics) {
+	auto& state = GpuTimestamps();
+	if (state.pool != nullptr || state.disabled) {
+		return state.pool != nullptr;
+	}
+	state.disabled = true;
+	if (!graphics.calibrated_timestamps_enabled || !graphics.host_query_reset_enabled ||
+	    graphics.physical_device_properties.limits.timestampComputeAndGraphics == VK_FALSE) {
+		return false;
+	}
+	state.get_calibrated = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
+	    graphics.device.getProcAddr("vkGetCalibratedTimestampsEXT"));
+	if (state.get_calibrated == nullptr) {
+		return false;
+	}
+	uint32_t domain_count = 0;
+	const auto get_domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT>(
+	    graphics.instance.getProcAddr("vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+	if (get_domains == nullptr ||
+	    get_domains(graphics.physical_device, &domain_count, nullptr) != VK_SUCCESS) {
+		return false;
+	}
+	std::vector<VkTimeDomainEXT> domains(domain_count);
+	get_domains(graphics.physical_device, &domain_count, domains.data());
+	const bool has_device = std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_DEVICE_EXT) !=
+	                        domains.end();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto host_domain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+#else
+	const auto host_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT;
+#endif
+	if (!has_device || std::find(domains.begin(), domains.end(), host_domain) == domains.end()) {
+		return false;
+	}
+	vk::QueryPoolCreateInfo info {};
+	info.queryType  = vk::QueryType::eTimestamp;
+	info.queryCount = GpuTimestampSlots;
+	if (graphics.device.createQueryPool(&info, nullptr, &state.pool) != vk::Result::eSuccess) {
+		state.pool = nullptr;
+		return false;
+	}
+	graphics.device.resetQueryPool(state.pool, 0, GpuTimestampSlots);
+	state.device      = graphics.device;
+	state.ns_per_tick = static_cast<double>(graphics.physical_device_properties.limits.timestampPeriod);
+	state.valid_mask  = ~uint64_t {0}; // full 64-bit device timestamps
+	state.busy        = std::vector<std::atomic<uint8_t>>(GpuTimestampSlots);
+	state.disabled    = false;
+	LOGF("GPU timestamps: guest timestamps follow GPU execution (%.3f ns per tick)\n",
+	     state.ns_per_tick);
+	return true;
+}
+
+// Host TSC at the moment of GPU timestamp gpu_ticks, from a calibration at most a second old.
+bool GpuTicksToTsc(uint64_t gpu_ticks, uint64_t& tsc) {
+	auto&      state     = GpuTimestamps();
+	const auto tsc_freq  = LibKernel::KernelGetTscFrequency();
+	const auto now_tsc   = LibKernel::KernelReadTsc();
+	std::lock_guard lock(state.calibration_mutex);
+	if (state.calibrated_at == 0 || now_tsc - state.calibrated_at > tsc_freq) {
+		VkCalibratedTimestampInfoEXT infos[2] {};
+		infos[0].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+		infos[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+		infos[1].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		infos[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+#else
+		infos[1].timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT;
+#endif
+		uint64_t stamps[2] {};
+		uint64_t deviation = 0;
+		if (state.get_calibrated(state.device, 2, infos, stamps, &deviation) != VK_SUCCESS) {
+			return false;
+		}
+		// Map the host sample onto the TSC: read both clocks now and step back.
+		const auto host_now = Common::Timer::QueryPerformanceCounter();
+		const auto tsc_now  = LibKernel::KernelReadTsc();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const double host_freq = static_cast<double>(Common::Timer::QueryPerformanceFrequency());
+		const double host_ago  = static_cast<double>(host_now) - static_cast<double>(stamps[1]);
+#else
+		// CLOCK_MONOTONIC_RAW nanoseconds; Timer::QueryPerformanceCounter uses the same clock here.
+		const double host_freq = static_cast<double>(Common::Timer::QueryPerformanceFrequency());
+		const double host_ago  = (static_cast<double>(host_now) / host_freq -
+		                          static_cast<double>(stamps[1]) / 1e9) * host_freq;
+#endif
+		state.calibrated_gpu = stamps[0] & state.valid_mask;
+		state.calibrated_tsc = tsc_now - static_cast<uint64_t>(std::max(0.0, host_ago) *
+		                                                        static_cast<double>(tsc_freq) /
+		                                                        host_freq);
+		state.calibrated_at  = tsc_now;
+	}
+	const auto   delta_ticks = static_cast<int64_t>(gpu_ticks - state.calibrated_gpu);
+	const double delta_ns    = static_cast<double>(delta_ticks) * state.ns_per_tick;
+	const double value       = static_cast<double>(state.calibrated_tsc) +
+	                     delta_ns * static_cast<double>(tsc_freq) / 1e9;
+	if (value <= 0.0) {
+		return false;
+	}
+	tsc = static_cast<uint64_t>(value);
+	return true;
+}
+
+} // namespace
+
+void RecordGpuTimestamp(CommandBuffer& buffer, void* dst, bool bottom_of_pipe) {
+	if (!GpuTimestampsEnabled() || dst == nullptr || !InitGpuTimestamps(buffer.GetGraphics())) {
+		return;
+	}
+	auto&      state = GpuTimestamps();
+	const auto slot  = state.next;
+	if (state.busy[slot].exchange(1u, std::memory_order_acq_rel) != 0u) {
+		return; // the ring is full of unread timestamps: keep the processing-time value
+	}
+	state.next = (state.next + 1) % GpuTimestampSlots;
+	buffer.Handle().writeTimestamp(bottom_of_pipe ? vk::PipelineStageFlagBits::eBottomOfPipe
+	                                              : vk::PipelineStageFlagBits::eTopOfPipe,
+	                               state.pool, slot);
+	auto& scheduler = buffer.GetContext().GetCommandScheduler();
+	scheduler.DeferPriorityOperation([slot, dst] {
+		auto&    state = GpuTimestamps();
+		uint64_t ticks = 0;
+		const auto result = state.device.getQueryPoolResults(
+		    state.pool, slot, 1, sizeof(ticks), &ticks, sizeof(ticks), vk::QueryResultFlagBits::e64);
+		uint64_t tsc   = 0;
+		uint64_t value = 0;
+		if (result == vk::Result::eSuccess && GpuTicksToTsc(ticks & state.valid_mask, tsc) &&
+		    ScaleReferenceClock(tsc, LibKernel::KernelGetTscFrequency(), value)) {
+			(void)LibKernel::Memory::TryWriteBacking(reinterpret_cast<uint64_t>(dst), &value, sizeof(value));
+		}
+		state.device.resetQueryPool(state.pool, slot, 1);
+		state.busy[slot].store(0u, std::memory_order_release);
+	});
 }
 
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };

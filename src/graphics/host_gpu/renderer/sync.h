@@ -19,6 +19,14 @@ namespace Sync {
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id);
 
+// A guest GPU timestamp (reference clock) written at this point of buffer: records a GPU
+// timestamp query there and, once the tick completes, rewrites the 64-bit value at dst with
+// that GPU time converted to the reference clock. bottom_of_pipe: after all prior work (end-of-
+// pipe events); otherwise when the command processor reaches it (COPY_DATA of the clock).
+// The caller has already written the value read at processing time, which stays in place
+// when the GPU time is unavailable. KYTY_GPU_TIMESTAMPS=0 disables the rewrite.
+void RecordGpuTimestamp(CommandBuffer& buffer, void* dst, bool bottom_of_pipe);
+
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                         uint32_t value);
 void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,

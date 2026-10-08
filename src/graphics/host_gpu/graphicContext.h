@@ -27,6 +27,9 @@ struct GraphicContext {
 	vk::Device                                device                                     = nullptr;
 	VmaAllocator                              allocator                                  = nullptr;
 	bool                                      memory_budget_ext_enabled                  = false;
+	// GPU timestamps for guest end-of-pipe timestamp writes (Sync::RecordGpuTimestamp).
+	bool                                      calibrated_timestamps_enabled              = false;
+	bool                                      host_query_reset_enabled                   = false;
 	bool                                      compute_subgroup_size_control_enabled      = false;
 	bool                                      sample_rate_shading_enabled                = false;
 	bool                                      shader_image_int64_atomics_enabled         = false;

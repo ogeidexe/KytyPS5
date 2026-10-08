@@ -455,6 +455,9 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	Common::FrameStats::g_guest_timestamps.fetch_add(1, std::memory_order_relaxed);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	if (num_bytes == sizeof(uint64_t)) {
+		Sync::RecordGpuTimestamp(CurrentBuffer(), reinterpret_cast<void*>(dst_address), false);
+	}
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1368,6 +1371,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					std::memcpy(dst, &value, sizeof(value));
+					if (event_write_source == 0x04) {
+						Sync::RecordGpuTimestamp(command, dst, true);
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {
