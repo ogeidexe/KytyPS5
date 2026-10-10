@@ -665,6 +665,15 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+namespace Libs::LibKernel {
+
+// The tests run no guest threads, so no range can overlap a live guest stack.
+bool FindLiveGuestStack(uint64_t, uint64_t, uint64_t *, uint64_t *) {
+  return false;
+}
+
+} // namespace Libs::LibKernel
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);

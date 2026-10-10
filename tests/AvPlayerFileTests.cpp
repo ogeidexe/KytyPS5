@@ -21,6 +21,12 @@ std::filesystem::path GetRealFilename(const std::string& path) {
 }
 }
 
+namespace Loader::Timer {
+double GetTimeMs() {
+	return 0.0;
+}
+} // namespace Loader::Timer
+
 namespace {
 using namespace Libs::Audio::AvPlayer;
 
